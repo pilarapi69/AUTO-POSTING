@@ -1155,9 +1155,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.7.0",
+      version: "1.8.0",
     };
   };
 
-  log("content script loaded v1.7.0 on", location.href);
+  log("content script loaded v1.8.0 on", location.href);
 })();

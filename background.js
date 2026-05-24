@@ -224,7 +224,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               else input.files = dt.files;
               input.dispatchEvent(new Event("change", { bubbles: true }));
               input.dispatchEvent(new Event("input", { bubbles: true }));
-              return { ok: true, count: dt.files.length };
+              // Diagnostic: log file detail (sampai 16 byte pertama hex)
+              const fileMeta = [];
+              for (let i = 0; i < dt.files.length; i++) {
+                const f = dt.files[i];
+                fileMeta.push({ name: f.name, size: f.size, type: f.type });
+              }
+              console.log("[AutoPosting:patch] files set:", fileMeta);
+              return { ok: true, count: dt.files.length, files: fileMeta };
             } catch (e) {
               return { ok: false, error: String(e) };
             }

@@ -97,6 +97,19 @@
               <input id="schedule-interval" type="number" min="1" step="1" value="60" />
             </label>
           </div>
+          <div class="grid-2" style="margin-top: 8px">
+            <label class="field">
+              <span>Jeda antar postingan (detik)</span>
+              <input id="row-delay" type="number" min="0" step="1" value="3" />
+            </label>
+            <label class="field">
+              <span>Re-encode PNG &rarr; JPEG sebelum upload</span>
+              <select id="force-jpeg">
+                <option value="auto" selected>Otomatis (hanya jika &gt; 10MB)</option>
+                <option value="always">Selalu (lebih reliable, file lebih kecil)</option>
+              </select>
+            </label>
+          </div>
           <div class="row" style="margin-top: 8px">
             <label class="checkbox">
               <input id="schedule-skip-existing" type="checkbox" checked />

@@ -16,6 +16,8 @@ const ui = {
   scheduleStart: /** @type {HTMLInputElement} */ (document.getElementById("schedule-start")),
   scheduleInterval: /** @type {HTMLInputElement} */ (document.getElementById("schedule-interval")),
   scheduleSkipExisting: /** @type {HTMLInputElement} */ (document.getElementById("schedule-skip-existing")),
+  rowDelay: /** @type {HTMLInputElement} */ (document.getElementById("row-delay")),
+  forceJpeg: /** @type {HTMLSelectElement} */ (document.getElementById("force-jpeg")),
 
   warnCard: document.getElementById("step-warn"),
   warnSummary: document.getElementById("warn-summary"),
@@ -351,28 +353,48 @@ async function compressImage(file, opts = {}) {
   throw new Error(`Gagal compress "${file.name}" di bawah ${formatSize(target)}`);
 }
 
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+
+function mimeFromExt(name) {
+  const e = ext(name);
+  const map = {
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".png": "image/png", ".gif": "image/gif",
+    ".webp": "image/webp", ".bmp": "image/bmp", ".tiff": "image/tiff",
+    ".mp4": "video/mp4", ".mov": "video/quicktime", ".m4v": "video/x-m4v",
+    ".webm": "video/webm", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
+    ".3gp": "video/3gpp",
+  };
+  return map[e] || "application/octet-stream";
+}
+
 /** Compress + serialize files untuk satu post sebelum kirim. */
-async function preparePostFiles(post, compress) {
+async function preparePostFiles(post, compress, forceJpegMode) {
   const out = [];
   for (const f of post.files) {
     let final = f;
-    if (compress && isImage(f) && f.size > META_PHOTO_LIMIT) {
+    const shouldForceJpeg = forceJpegMode === "always" && isImage(f);
+    const shouldCompress = compress && isImage(f) && f.size > META_PHOTO_LIMIT;
+    if (shouldForceJpeg || shouldCompress) {
       try {
-        log(`Compressing ${f.name} (${formatSize(f.size)})…`, "warn");
+        log(`Re-encoding ${f.name} (${formatSize(f.size)}, type=${f.type || mimeFromExt(f.name)})\u2026`, "warn");
+        // Re-encode dengan target file size 9.5MB; kalau aslinya sudah JPEG kecil, hasilnya ~mirip.
         final = await compressImage(f);
-        log(`  → ${final.name} ${formatSize(final.size)} (type=${final.type})`, "ok");
+        log(`  \u2192 ${final.name} ${formatSize(final.size)} (type=${final.type})`, "ok");
       } catch (e) {
-        log(`Compress gagal untuk ${f.name}: ${e.message}. Pakai file asli (kemungkinan Meta tolak).`, "err");
+        log(`Re-encode gagal untuk ${f.name}: ${e.message}. Pakai file asli.`, "err");
       }
     } else if (compress && isVideo(f) && f.size > META_PHOTO_LIMIT) {
-      log(`Video ${f.name} > 10MB — dikirim apa adanya (compress manual jika perlu).`, "warn");
+      log(`Video ${f.name} > 10MB \u2014 dikirim apa adanya (compress manual jika perlu).`, "warn");
     }
-    // Safety: kalau setelah compress masih > 10MB, warn user (Meta akan tolak)
+    // Pastikan type tidak kosong (webkitdirectory kadang tidak set type)
+    let outType = final.type;
+    if (!outType) outType = mimeFromExt(final.name);
     if (final.size > META_PHOTO_LIMIT && isImage(final)) {
-      log(`PERINGATAN ${final.name}: ${formatSize(final.size)} masih > 10MB — Meta kemungkinan tolak.`, "warn");
+      log(`PERINGATAN ${final.name}: ${formatSize(final.size)} masih > 10MB \u2014 Meta kemungkinan tolak.`, "warn");
     }
     const buf = await final.arrayBuffer();
-    out.push({ name: final.name, type: final.type, lastModified: final.lastModified || Date.now(), buffer: buf });
+    out.push({ name: final.name, type: outType, lastModified: final.lastModified || Date.now(), buffer: buf });
   }
   return out;
 }
@@ -524,8 +546,10 @@ async function startAutomation() {
   }
   const times = getScheduledTimes();
   const skipExisting = ui.scheduleSkipExisting.checked;
+  const rowDelaySec = Math.max(0, Number(ui.rowDelay.value || 0));
+  const forceJpegMode = ui.forceJpeg.value || "auto";
 
-  log(`Mulai automasi ${usable} postingan pada tab "${state.selectedTab.title || state.selectedTab.url}"`, "info");
+  log(`Mulai automasi ${usable} postingan pada tab "${state.selectedTab.title || state.selectedTab.url}" (jeda ${rowDelaySec}s, re-encode=${forceJpegMode})`, "info");
   setProgress(0, usable, `0/${usable}`);
 
   // Inject ulang content script untuk keamanan (kalau halaman dibuka sebelum extension dimuat)
@@ -561,15 +585,25 @@ async function startAutomation() {
       break;
     }
 
+    // Jeda antar postingan (kecuali yang pertama)
+    if (i > 0 && rowDelaySec > 0) {
+      log(`Jeda ${rowDelaySec}s sebelum postingan #${i + 1}\u2026`, "info");
+      await sleep(rowDelaySec * 1000);
+      if (state.abortRequested) {
+        log("STOP diaktifkan. Menghentikan loop.", "warn");
+        break;
+      }
+    }
+
     const post = state.postsMedia[i];
     const caption = state.captions[i];
     const when = times[i];
 
-    log(`#${i + 1}: "${truncate(caption, 60)}" — ${post.files.length} media — jadwal: ${formatHuman(when)}`, "info");
+    log(`#${i + 1}: "${truncate(caption, 60)}" \u2014 ${post.files.length} media \u2014 jadwal: ${formatHuman(when)}`, "info");
     setProgress(i, usable, `Memproses ${i + 1}/${usable}`);
 
     // Compress (jika perlu) + serialize files to ArrayBuffer for messaging
-    const filesPayload = await preparePostFiles(post, ui.autoCompress.checked);
+    const filesPayload = await preparePostFiles(post, ui.autoCompress.checked, forceJpegMode);
 
     let response;
     try {
