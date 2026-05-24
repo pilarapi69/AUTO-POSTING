@@ -132,48 +132,82 @@
     try { el.value = value; return true; } catch { return false; }
   }
 
-  /** Ketik karakter ke field per-character, dgn full event sequence yang
-   *  React + Lexical pasti tangkap:
-   *    keydown \u2192 beforeinput(insertText) \u2192 [exec insert] \u2192 input(insertText) \u2192 keyup
-   *  Strategi insert:
-   *    - INPUT/TEXTAREA: native setter (append char ke value)
-   *    - contenteditable (Lexical): document.execCommand("insertText", ch)
-   *      generates REAL browser input event, Lexical handler aman.
-   *  Per-char inilah yg bikin Lexical state ter-sync sungguhan (vs bulk
-   *  setValue yang Lexical anggap data-corruption \u2192 placeholder tetap render). */
+  /** Pindahkan caret ke akhir contenteditable via Selection API.
+   *  Lexical butuh tahu insertion point sebelum execCommand("insertText"). */
+  function placeCaretAtEnd(el) {
+    try {
+      el.focus();
+      const range = document.createRange();
+      range.selectNodeContents(el);
+      range.collapse(false); // collapse to end
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(range);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Ketik teks ke field. Strategi berbeda by element type:
+   *
+   *  INPUT/TEXTAREA (React tracker):
+   *    Per-char dgn keydown \u2192 beforeinput \u2192 setNativeProtoValue \u2192 input \u2192 keyup
+   *    React onChange terpicu via fiber tracker.
+   *
+   *  contenteditable (Lexical):
+   *    1) placeCaretAtEnd \u2014 set selection di akhir
+   *    2) PER-CHAR execCommand("insertText", false, ch) HANYA \u2014 jangan
+   *       dispatch beforeinput/input manual karena execCommand SUDAH fire
+   *       event2 itu secara native. Duplikat event \u2192 Lexical state corrupt
+   *       \u2192 crash 'getIn' (v1.14).
+   *    3) Pastikan TARGET adalah Lexical editor asli (paling dalam), bukan
+   *       combobox wrapper. Lihat findEditableTarget(). */
   async function typeIntoField(el, text, delay = 18) {
     if (!el || !text) return false;
-    try { el.focus(); } catch {}
     const isText = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
-    for (const ch of text) {
-      try {
-        el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true, cancelable: true }));
-      } catch {}
-      try {
-        el.dispatchEvent(new InputEvent("beforeinput", {
-          inputType: "insertText", data: ch, bubbles: true, cancelable: true,
-        }));
-      } catch {}
-      if (isText) {
-        setNativeProtoValue(el, (el.value || "") + ch);
-      } else if (el.isContentEditable) {
+
+    if (isText) {
+      try { el.focus(); } catch {}
+      for (const ch of text) {
+        try { el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true, cancelable: true })); } catch {}
         try {
-          document.execCommand("insertText", false, ch);
-        } catch {
-          try { el.innerText = (el.innerText || "") + ch; } catch {}
-        }
+          el.dispatchEvent(new InputEvent("beforeinput", {
+            inputType: "insertText", data: ch, bubbles: true, cancelable: true,
+          }));
+        } catch {}
+        setNativeProtoValue(el, (el.value || "") + ch);
+        try {
+          el.dispatchEvent(new InputEvent("input", {
+            inputType: "insertText", data: ch, bubbles: true,
+          }));
+        } catch {}
+        try { el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true, cancelable: true })); } catch {}
+        if (delay > 0) await sleep(delay);
       }
+      try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+      return true;
+    }
+
+    // contenteditable / Lexical path
+    placeCaretAtEnd(el);
+    await sleep(20);
+    for (const ch of text) {
+      let inserted = false;
       try {
-        el.dispatchEvent(new InputEvent("input", {
-          inputType: "insertText", data: ch, bubbles: true,
-        }));
+        inserted = document.execCommand("insertText", false, ch);
       } catch {}
-      try {
-        el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true, cancelable: true }));
-      } catch {}
+      if (!inserted) {
+        // Fallback (very rare): direct text node append + manual input event
+        try {
+          const node = document.createTextNode(ch);
+          el.appendChild(node);
+          placeCaretAtEnd(el);
+          el.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: ch, bubbles: true }));
+        } catch {}
+      }
       if (delay > 0) await sleep(delay);
     }
-    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
     return true;
   }
 
@@ -920,28 +954,64 @@
     } catch {}
   }
 
-  /** Isi caption ke row dgn typeIntoField (per-character, React+Lexical safe).
-   *  Prioritas target:
-   *   - [role='textbox'][contenteditable='true']  (Lexical rich editor)
-   *   - [contenteditable='true']
-   *   - textarea
-   *  Per-character typing trigger native browser input event yg Lexical
-   *  process aman tanpa crash 'getIn' (yg dialami v1.12 paste approach). */
+  /** Cari editable target sungguhan dalam row caption.
+   *  Meta render structure: <div role="combobox" contenteditable="true">
+   *                          <div data-lexical-editor="true" contenteditable="true" role="textbox">
+   *                            <p><br></p>
+   *                          </div>
+   *                        </div>
+   *  KEDUA div punya contenteditable=true! Tapi event harus landing di INNER
+   *  (Lexical editor asli), bukan combobox wrapper. Kalau salah target,
+   *  Lexical state corrupt \u2192 crash 'getIn' (v1.14 bug).
+   *
+   *  Strategi: pilih element paling dalam (no nested contenteditable child). */
+  function findEditableTarget(row) {
+    // 1. Prefer [data-lexical-editor='true'] (paling explicit)
+    const lexical = row.querySelector("[data-lexical-editor='true']");
+    if (lexical) return lexical;
+    // 2. Cari semua contenteditable, pilih yg TIDAK punya child contenteditable
+    const all = Array.from(row.querySelectorAll("[contenteditable='true']"));
+    for (const el of all) {
+      if (!el.querySelector("[contenteditable='true']")) {
+        return el;
+      }
+    }
+    // 3. Fallback: role=textbox
+    const textbox = row.querySelector("[role='textbox']");
+    if (textbox) return textbox;
+    // 4. Last resort: textarea
+    return row.querySelector("textarea");
+  }
+
+  /** Isi caption ke row dgn typeIntoField (per-character, Lexical-safe).
+   *  Strategi target: paling dalam (lihat findEditableTarget). Strategi
+   *  insertion: per-char execCommand untuk contenteditable, biarkan browser
+   *  fire beforeinput/input native \u2014 jangan dispatch manual karena duplikat
+   *  event \u2192 Lexical state corrupt. */
   async function fillCaptionInRow(row, caption) {
-    let target =
-      row.querySelector("[role='textbox'][contenteditable='true']") ||
-      row.querySelector("[contenteditable='true']") ||
-      row.querySelector("textarea");
+    const target = findEditableTarget(row);
     if (!target) throw new Error("Tidak menemukan input teks pada row");
+    const existing =
+      target.tagName === "INPUT" || target.tagName === "TEXTAREA"
+        ? (target.value || "")
+        : (target.innerText || "").trim();
     log("fill caption target:", target.tagName,
         "role=", target.getAttribute("role"),
         "contenteditable=", target.getAttribute("contenteditable"),
-        "len=", caption.length);
-    // Bersihkan dulu (kalau ada placeholder text di textarea/contenteditable)
-    clearTextField(target);
-    await sleep(40);
-    // Type per-character
-    await typeIntoField(target, caption, 12);
+        "data-lexical=", target.getAttribute("data-lexical-editor"),
+        "len=", caption.length,
+        "existing=", JSON.stringify(existing.slice(0, 60)));
+    // Hanya clear kalau ada existing content (skip untuk Lexical kosong)
+    if (existing && existing.length > 0) {
+      clearTextField(target);
+      await sleep(60);
+    } else {
+      // Klik dulu untuk fokus + place caret di Lexical
+      try { target.focus(); } catch {}
+      await sleep(40);
+    }
+    // Type per-character via execCommand (browser handles input events natively)
+    await typeIntoField(target, caption, 10);
     await sleep(120);
   }
 
@@ -1467,9 +1537,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.14.0",
+      version: "1.15.0",
     };
   };
 
-  log("content script loaded v1.14.0 on", location.href);
+  log("content script loaded v1.15.0 on", location.href);
 })();
