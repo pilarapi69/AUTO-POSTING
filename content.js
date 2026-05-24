@@ -914,14 +914,37 @@
     processedCount: 0,
   };
 
+  // ArrayBuffer hilang lewat chrome.tabs.sendMessage (JSON serialization),
+  // jadi control.js kirim b64. Decode di sini.
+  function b64ToBytes(b64) {
+    const bin = atob(b64);
+    const len = bin.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
   async function processJob(message) {
     const { job, index, total } = message;
     setBadgeText(`Auto Posting · ${index + 1}/${total}`);
 
-    // Rebuild File objects
+    // Rebuild File objects dari base64
     const files = job.files.map((f) => {
-      const blob = new Blob([f.buffer], { type: f.type || guessType(f.name) });
-      return new File([blob], f.name, { type: blob.type, lastModified: f.lastModified || Date.now() });
+      // Backward compat: kalau ada buffer ArrayBuffer (legacy), pakai itu;
+      // tapi sekarang yang aktif adalah f.b64
+      let bytes;
+      if (f.b64) {
+        bytes = b64ToBytes(f.b64);
+      } else if (f.buffer) {
+        bytes = f.buffer;
+      } else {
+        throw new Error(`File ${f.name}: tidak ada payload (b64/buffer) \u2014 message serialization issue`);
+      }
+      const type = f.type || guessType(f.name);
+      const blob = new Blob([bytes], { type });
+      const file = new File([blob], f.name, { type: blob.type, lastModified: f.lastModified || Date.now() });
+      log(`rebuild file: ${f.name} \u2192 ${file.size} bytes, type=${file.type}`);
+      return file;
     });
 
     // Tentukan target row
@@ -1155,9 +1178,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.9.0",
+      version: "1.10.0",
     };
   };
 
-  log("content script loaded v1.9.0 on", location.href);
+  log("content script loaded v1.10.0 on", location.href);
 })();

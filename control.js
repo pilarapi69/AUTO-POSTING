@@ -355,6 +355,20 @@ async function compressImage(file, opts = {}) {
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
+/** ArrayBuffer \u2192 base64 (chunked agar tidak overflow stack untuk file besar).
+ *  PENTING: chrome.tabs.sendMessage SERIALIZES via JSON, BUKAN structured clone.
+ *  Itu artinya ArrayBuffer & TypedArray HILANG di sisi penerima (jadi {}).
+ *  Solusi: konversi ke base64 string sebelum kirim, decode di sisi penerima. */
+function abToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const CHUNK = 0x8000;
+  let str = "";
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    str += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(str);
+}
+
 function mimeFromExt(name) {
   const e = ext(name);
   const map = {
@@ -394,7 +408,9 @@ async function preparePostFiles(post, compress, forceJpegMode) {
       log(`PERINGATAN ${final.name}: ${formatSize(final.size)} masih > 10MB \u2014 Meta kemungkinan tolak.`, "warn");
     }
     const buf = await final.arrayBuffer();
-    out.push({ name: final.name, type: outType, lastModified: final.lastModified || Date.now(), buffer: buf });
+    const b64 = abToBase64(buf);
+    log(`  serialize ${final.name}: ${buf.byteLength} bytes \u2192 b64 ${b64.length} chars`, "info");
+    out.push({ name: final.name, type: outType, lastModified: final.lastModified || Date.now(), b64 });
   }
   return out;
 }
