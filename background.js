@@ -167,10 +167,204 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Upload kombo: patch HTMLInputElement.prototype.click di MAIN world,
-  // klik tombol "Tambahkan foto/video", intercept input.click() yg dipanggil halaman,
-  // set files via DataTransfer + dispatch change, lalu restore.
-  // Semua dalam satu execution agar atomik.
+  // Install PERMANENT patch HTMLInputElement.prototype.click di MAIN world.
+  // Patch baca window.__autoPostingState.{active, nextFiles}.
+  // - active && nextFiles  \u2192 set files (DataTransfer) + dispatch change + mark consumed
+  // - active && !nextFiles \u2192 suppress OS dialog (no-op)
+  // - !active              \u2192 original click (OS dialog terbuka normal)
+  if (msg.type === "INSTALL_SESSION_PATCH") {
+    const tabId = msg.tabId || sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: "missing tabId" });
+      return;
+    }
+    chrome.scripting
+      .executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: () => {
+          if (window.__autoPostingPatched) {
+            window.__autoPostingState.active = true;
+            return { ok: true, already: true };
+          }
+          const origClick = HTMLInputElement.prototype.click;
+          window.__autoPostingState = {
+            active: true,
+            nextFiles: null,
+            consumed: false,
+            lastError: null,
+          };
+          window.__autoPostingOrigClick = origClick;
+
+          function b64ToBytes(b64) {
+            const bin = atob(b64);
+            const len = bin.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+            return bytes;
+          }
+          function buildFiles(specs) {
+            const dt = new DataTransfer();
+            for (const s of specs) {
+              const bytes = b64ToBytes(s.b64);
+              const blob = new Blob([bytes], { type: s.type || "application/octet-stream" });
+              const file = new File([blob], s.name, {
+                type: blob.type,
+                lastModified: s.lastModified || Date.now(),
+              });
+              dt.items.add(file);
+            }
+            return dt;
+          }
+          function setFilesOn(input, specs) {
+            try {
+              const dt = buildFiles(specs);
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "files")?.set;
+              if (setter) setter.call(input, dt.files);
+              else input.files = dt.files;
+              input.dispatchEvent(new Event("change", { bubbles: true }));
+              input.dispatchEvent(new Event("input", { bubbles: true }));
+              return { ok: true, count: dt.files.length };
+            } catch (e) {
+              return { ok: false, error: String(e) };
+            }
+          }
+
+          HTMLInputElement.prototype.click = function () {
+            const st = window.__autoPostingState;
+            if (st && st.active && this.type === "file") {
+              if (st.nextFiles && st.nextFiles.length) {
+                const res = setFilesOn(this, st.nextFiles);
+                console.log("[AutoPosting:patch] intercepted input.click()", res, { name: this.name, accept: this.accept });
+                st.nextFiles = null;
+                st.consumed = true;
+                if (!res.ok) st.lastError = res.error;
+                return;
+              }
+              // tidak ada queue: suppress untuk hindari OS dialog
+              console.log("[AutoPosting:patch] suppressed input.click() (no queued files)", { name: this.name });
+              return;
+            }
+            return window.__autoPostingOrigClick.call(this);
+          };
+          window.__autoPostingPatched = true;
+          return { ok: true, already: false };
+        },
+      })
+      .then((res) => sendResponse({ ok: true, res }))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
+  // Deactivate patch (tetap installed tapi tidak intercept lagi)
+  if (msg.type === "UNINSTALL_SESSION_PATCH") {
+    const tabId = msg.tabId || sender.tab?.id;
+    if (!tabId) {
+      sendResponse({ ok: false, error: "missing tabId" });
+      return;
+    }
+    chrome.scripting
+      .executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: () => {
+          if (window.__autoPostingState) window.__autoPostingState.active = false;
+          return { ok: true };
+        },
+      })
+      .then((res) => sendResponse({ ok: true, res }))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
+  // Pre-queue files untuk patch + klik tombol + tunggu consumed
+  if (msg.type === "UPLOAD_V2") {
+    const tabId = msg.tabId || sender.tab?.id;
+    const buttonSelector = msg.buttonSelector;
+    const fileSpecs = msg.files;
+    const timeoutMs = msg.timeoutMs || 8000;
+    if (!tabId || !buttonSelector || !Array.isArray(fileSpecs)) {
+      sendResponse({ ok: false, error: "missing args" });
+      return;
+    }
+    chrome.scripting
+      .executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: (btnSel, specs, tmo) => {
+          return new Promise((resolve) => {
+            if (!window.__autoPostingPatched) {
+              resolve({ ok: false, error: "session patch not installed" });
+              return;
+            }
+            const st = window.__autoPostingState;
+            st.active = true;
+            st.nextFiles = specs;
+            st.consumed = false;
+            st.lastError = null;
+
+            const btn = document.querySelector(btnSel);
+            if (!btn) {
+              resolve({ ok: false, error: "button not found: " + btnSel });
+              return;
+            }
+
+            // Full event sequence + native .click()
+            try {
+              const rect = btn.getBoundingClientRect();
+              const cx = rect.left + rect.width / 2;
+              const cy = rect.top + rect.height / 2;
+              const opts = {
+                bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+                button: 0, buttons: 1, detail: 1,
+              };
+              const popts = { ...opts, pointerType: "mouse", pointerId: 1, isPrimary: true, pressure: 0.5 };
+              btn.dispatchEvent(new PointerEvent("pointerover", popts));
+              btn.dispatchEvent(new PointerEvent("pointerenter", popts));
+              btn.dispatchEvent(new MouseEvent("mouseover", opts));
+              btn.dispatchEvent(new MouseEvent("mouseenter", opts));
+              btn.dispatchEvent(new PointerEvent("pointerdown", popts));
+              btn.dispatchEvent(new MouseEvent("mousedown", opts));
+              btn.dispatchEvent(new PointerEvent("pointerup", popts));
+              btn.dispatchEvent(new MouseEvent("mouseup", opts));
+              btn.dispatchEvent(new MouseEvent("click", opts));
+              try { btn.focus?.(); } catch {}
+              try { btn.click(); } catch {}
+            } catch (e) {
+              resolve({ ok: false, error: "click error: " + String(e) });
+              return;
+            }
+
+            // Poll consumed flag
+            const start = Date.now();
+            const tick = () => {
+              if (st.consumed) {
+                resolve({ ok: true, consumed: true });
+                return;
+              }
+              if (st.lastError) {
+                resolve({ ok: false, error: "patch error: " + st.lastError });
+                return;
+              }
+              if (Date.now() - start >= tmo) {
+                st.nextFiles = null;
+                resolve({ ok: false, error: "consumed flag not set in " + tmo + "ms" });
+                return;
+              }
+              setTimeout(tick, 80);
+            };
+            tick();
+          });
+        },
+        args: [buttonSelector, fileSpecs, timeoutMs],
+      })
+      .then((res) => sendResponse({ ok: true, res }))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
+  // (Legacy) Upload kombo per-row, patch temporary.
   if (msg.type === "UPLOAD_VIA_BUTTON_CLICK") {
     const tabId = msg.tabId || sender.tab?.id;
     const buttonSelector = msg.buttonSelector;

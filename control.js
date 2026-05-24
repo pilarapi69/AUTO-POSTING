@@ -360,12 +360,16 @@ async function preparePostFiles(post, compress) {
       try {
         log(`Compressing ${f.name} (${formatSize(f.size)})…`, "warn");
         final = await compressImage(f);
-        log(`  → ${final.name} ${formatSize(final.size)}`, "ok");
+        log(`  → ${final.name} ${formatSize(final.size)} (type=${final.type})`, "ok");
       } catch (e) {
         log(`Compress gagal untuk ${f.name}: ${e.message}. Pakai file asli (kemungkinan Meta tolak).`, "err");
       }
     } else if (compress && isVideo(f) && f.size > META_PHOTO_LIMIT) {
       log(`Video ${f.name} > 10MB — dikirim apa adanya (compress manual jika perlu).`, "warn");
+    }
+    // Safety: kalau setelah compress masih > 10MB, warn user (Meta akan tolak)
+    if (final.size > META_PHOTO_LIMIT && isImage(final)) {
+      log(`PERINGATAN ${final.name}: ${formatSize(final.size)} masih > 10MB — Meta kemungkinan tolak.`, "warn");
     }
     const buf = await final.arrayBuffer();
     out.push({ name: final.name, type: final.type, lastModified: final.lastModified || Date.now(), buffer: buf });
@@ -481,12 +485,23 @@ function refreshStartEnabled() {
   ui.btnStop.disabled = !state.running;
 }
 
+async function endSessionPatch() {
+  if (!state.selectedTab) return;
+  try {
+    await chrome.tabs.sendMessage(state.selectedTab.id, { type: "END_SESSION" });
+  } catch {}
+}
+
 ui.btnStart.addEventListener("click", () => {
-  startAutomation().catch((e) => {
-    log("Error: " + (e?.message || e), "err");
-    state.running = false;
-    refreshStartEnabled();
-  });
+  startAutomation()
+    .catch((e) => {
+      log("Error: " + (e?.message || e), "err");
+    })
+    .finally(() => {
+      state.running = false;
+      refreshStartEnabled();
+      endSessionPatch();
+    });
 });
 
 ui.btnStop.addEventListener("click", () => {

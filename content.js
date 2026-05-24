@@ -207,28 +207,46 @@
     }
   }
 
-  /** Klik tombol upload + intercept input.click() di MAIN world (combo atomik). */
-  async function uploadViaButtonClickMainWorld(button, files, opts = {}) {
+  /** Install patch session permanent (idempotent). */
+  async function installSessionPatch() {
+    try {
+      const res = await chrome.runtime.sendMessage({ type: "INSTALL_SESSION_PATCH" });
+      log("session patch install:", res?.res);
+      return res?.ok === true;
+    } catch (e) {
+      log("install session patch error:", String(e));
+      return false;
+    }
+  }
+
+  /** Uninstall (deaktivasi) patch session. */
+  async function uninstallSessionPatch() {
+    try {
+      await chrome.runtime.sendMessage({ type: "UNINSTALL_SESSION_PATCH" });
+    } catch {}
+  }
+
+  /** Upload v2: pre-queue files ke patch + klik tombol via main world + tunggu consumed flag. */
+  async function uploadV2(button, files, opts = {}) {
     if (!button) return { ok: false, error: "button null" };
     const tag = "__ap_upload_" + Math.random().toString(36).slice(2);
     button.setAttribute("data-ap-upload", tag);
     try {
       const specs = await filesToSpecs(files);
       const res = await chrome.runtime.sendMessage({
-        type: "UPLOAD_VIA_BUTTON_CLICK",
+        type: "UPLOAD_V2",
         buttonSelector: '[data-ap-upload="' + tag + '"]',
         files: specs,
-        interceptTimeoutMs: opts.timeout || 6000,
+        timeoutMs: opts.timeout || 8000,
       });
-      log("upload-via-button-click result:", res?.res);
-      // res = { ok: true, res: [{ frameId, result: {...} }] }
+      log("upload-v2 result:", res?.res);
       const frameResult = res?.res?.[0]?.result;
       if (frameResult && frameResult.ok) {
-        return { ok: true, source: frameResult.source, count: frameResult.count };
+        return { ok: true, consumed: frameResult.consumed };
       }
       return { ok: false, error: frameResult?.error || "unknown error" };
     } catch (e) {
-      log("upload-via-button-click error:", String(e));
+      log("upload-v2 error:", String(e));
       return { ok: false, error: String(e) };
     } finally {
       try { button.removeAttribute("data-ap-upload"); } catch {}
@@ -527,12 +545,12 @@
           const target = climbToClickable(btns[0]);
           await ultraClick(target);
           await sleep(200);
-          return { closed: true, reason: txt.substring(0, 200) };
+          return { closed: true, reason: txt.substring(0, 500) };
         }
       }
       pressEscape();
       await sleep(200);
-      return { closed: true, reason: txt.substring(0, 200), via: "escape" };
+      return { closed: true, reason: txt.substring(0, 500), via: "escape" };
     }
     return { closed: false };
   }
@@ -606,9 +624,8 @@
     }
   }
 
-  /** Upload file untuk row. Strategi utama: UPLOAD_VIA_BUTTON_CLICK (combo main-world).
-   *   1) Cari tombol "Tambahkan foto/video" di row → patch prototype.click di main world
-   *      → klik tombol → intercept input.click() → set files via DataTransfer + dispatch change
+  /** Upload file untuk row. Pakai UPLOAD_V2 (session patch permanent).
+   *   1) Cari tombol "Tambahkan foto/video" di row → pre-queue files ke patch → klik tombol → patch consume
    *   2) Fallback: kalau ada modal upload di dalam, klik tombol upload di modal & ulang flow
    *   3) Fallback terakhir: drop files trusted via main world
    */
@@ -617,15 +634,15 @@
     const addBtn = findAddMediaButton(row);
     if (!addBtn) throw new Error("Tombol 'Tambahkan foto/video' tidak ditemukan di row");
 
-    log("step 1: UPLOAD_VIA_BUTTON_CLICK (combo main-world)");
-    let res = await uploadViaButtonClickMainWorld(addBtn, files, { timeout: 6000 });
+    log("step 1: UPLOAD_V2 (session patch)");
+    let res = await uploadV2(addBtn, files, { timeout: 8000 });
     if (res.ok) {
-      log(`step 1 berhasil via ${res.source}, ${res.count} file`);
+      log(`step 1 berhasil, file di-set ke input via patch`);
       // Tunggu preview muncul ATAU error dialog Meta muncul (race)
       const verdict = await waitForUploadOutcome(row, 30000);
       pressEscape();
       if (verdict.rejected) {
-        throw new Error("Meta tolak file: " + (verdict.reason || "format/size tidak valid").substring(0, 200));
+        throw new Error("Meta tolak file: " + (verdict.reason || "format/size tidak valid"));
       }
       if (!verdict.hasMedia) {
         log("warning preview media: tidak terlihat, lanjut");
@@ -662,15 +679,14 @@
         els.sort((a, b) => depth(b) - depth(a));
         const target = climbToClickable(els[0]);
         log(`step 2: coba kombo via tombol modal "${kw}"`);
-        res = await uploadViaButtonClickMainWorld(target, files, { timeout: 6000 });
+        res = await uploadV2(target, files, { timeout: 8000 });
         if (res.ok) {
-          log(`step 2 berhasil via ${res.source}, ${res.count} file`);
-          try {
-            await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
-          } catch (e) {
-            log("warning preview media: " + e.message);
-          }
+          log(`step 2 berhasil, file di-set ke input via patch`);
+          const verdict = await waitForUploadOutcome(row, 30000);
           pressEscape();
+          if (verdict.rejected) {
+            throw new Error("Meta tolak file: " + (verdict.reason || "format/size tidak valid"));
+          }
           return;
         }
       }
@@ -1089,8 +1105,17 @@
       session.skipExisting = !!msg.options?.skipExisting;
       session.processedCount = 0;
       showBadge();
-      sendResponse({ ok: true });
-      return;
+      // Install patch session permanen (intercept SEMUA input.click() selama session aktif)
+      installSessionPatch().then((ok) => {
+        log("session patch ready:", ok);
+        sendResponse({ ok: true, patch: ok });
+      });
+      return true; // async
+    }
+
+    if (msg.type === "END_SESSION") {
+      uninstallSessionPatch().finally(() => sendResponse({ ok: true }));
+      return true;
     }
 
     if (msg.type === "PROCESS_JOB") {
@@ -1130,9 +1155,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.6.0",
+      version: "1.7.0",
     };
   };
 
-  log("content script loaded v1.6.0 on", location.href);
+  log("content script loaded v1.7.0 on", location.href);
 })();
