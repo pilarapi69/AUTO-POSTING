@@ -117,6 +117,53 @@
     el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
   }
 
+  /** Fill teks ke input/textarea/contenteditable dengan event React-compatible.
+   *  Pakai execCommand("insertText") agar React/Lexical state ter-sync (user bisa
+   *  edit/hapus per-karakter setelahnya). Jika execCommand tidak tersedia atau
+   *  gagal, fallback ke native setter + InputEvent.
+   *  HARUS dipanggil dari context yang sudah ter-focus (kita panggil el.focus()
+   *  sebelumnya). */
+  function fillTextField(el, text) {
+    if (!el) return false;
+    try {
+      el.focus();
+    } catch {}
+    // Select all existing content lalu hapus
+    try {
+      if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+        const len = (el.value || "").length;
+        try { el.setSelectionRange?.(0, len); } catch {}
+        try { el.select?.(); } catch {}
+      } else {
+        // contenteditable
+        const sel = window.getSelection();
+        if (sel) {
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+      }
+    } catch {}
+    let inserted = false;
+    try {
+      const delOk = document.execCommand("delete", false, null);
+      // Insert via execCommand (generates beforeinput + input dgn inputType=insertText)
+      inserted = document.execCommand("insertText", false, text);
+    } catch {}
+    // Verifikasi: kalau target masih kosong (insert gagal), fallback ke setter
+    const isText = el.tagName === "TEXTAREA" || el.tagName === "INPUT";
+    const currentVal = isText ? (el.value || "") : (el.textContent || "");
+    if (!inserted || currentVal !== text) {
+      if (isText) {
+        setNativeValue(el, text);
+      } else {
+        setContentEditable(el, text);
+      }
+    }
+    return true;
+  }
+
   /** Klik manusia: dispatch pointer/mouse events (di isolated world) */
   function realClick(el) {
     if (!el) return;
@@ -730,19 +777,13 @@
 
   /** Isi caption ke row */
   async function fillCaptionInRow(row, caption) {
-    // Coba textarea terlebih dulu
-    let ta = row.querySelector("textarea");
-    if (!ta) {
-      // fallback contenteditable
-      const ce = row.querySelector("[contenteditable='true']");
-      if (ce) {
-        setContentEditable(ce, caption);
-        return;
-      }
-      throw new Error("Tidak menemukan input teks pada row");
-    }
-    ta.focus();
-    setNativeValue(ta, caption);
+    // Coba textarea terlebih dulu, lalu contenteditable
+    let target = row.querySelector("textarea");
+    if (!target) target = row.querySelector("[contenteditable='true']");
+    if (!target) throw new Error("Tidak menemukan input teks pada row");
+    fillTextField(target, caption);
+    // Beri sedikit waktu agar React/Lexical update state
+    await sleep(80);
   }
 
   /** Klik tombol dropdown "Terbitkan s..." pada row */
@@ -801,6 +842,12 @@
   /** Set tanggal & waktu di popover */
   async function setScheduleDateTime(popover, dateObj) {
     const inputs = Array.from(popover.querySelectorAll("input"));
+    log("schedule inputs found:", inputs.length, inputs.map((i) => ({
+      type: i.type,
+      placeholder: i.placeholder,
+      aria: i.getAttribute("aria-label"),
+      value: i.value,
+    })));
     if (inputs.length < 2) throw new Error("Field tanggal/waktu tidak lengkap");
 
     // Identifikasi: input pertama = tanggal, kedua = waktu (berdasarkan ordering & placeholder/aria)
@@ -818,48 +865,58 @@
     if (!timeInput) timeInput = inputs[inputs.length - 1];
     if (dateInput === timeInput && inputs.length >= 2) timeInput = inputs[1];
 
+    log("schedule picked: date=", { val: dateInput.value, aria: dateInput.getAttribute("aria-label") },
+        "time=", { val: timeInput.value, aria: timeInput.getAttribute("aria-label") });
+
     const dd = dateObj.getDate();
     const mm = dateObj.getMonth();
     const yyyy = dateObj.getFullYear();
     const HH = String(dateObj.getHours()).padStart(2, "0");
     const MM = String(dateObj.getMinutes()).padStart(2, "0");
 
-    // Format kandidat untuk tanggal (coba beberapa)
+    // Format kandidat untuk tanggal
     const dateCandidates = [
+      `${String(dd).padStart(2, "0")}/${String(mm + 1).padStart(2, "0")}/${yyyy}`,
+      `${dd}/${mm + 1}/${yyyy}`,
       `${dd} ${INDO_MONTHS_SHORT[mm]} ${yyyy}`,
       `${dd} ${INDO_MONTHS_FULL[mm]} ${yyyy}`,
-      `${String(dd).padStart(2, "0")}/${String(mm + 1).padStart(2, "0")}/${yyyy}`,
       `${yyyy}-${String(mm + 1).padStart(2, "0")}-${String(dd).padStart(2, "0")}`,
     ];
 
     let dateOk = false;
     for (const val of dateCandidates) {
       try {
-        dateInput.focus();
-        setNativeValue(dateInput, val);
-        await sleep(120);
-        if ((dateInput.value || "").trim() !== "") {
+        fillTextField(dateInput, val);
+        await sleep(180);
+        const got = (dateInput.value || "").trim();
+        log(`try date "${val}" -> input.value="${got}"`);
+        if (got !== "") {
           dateOk = true;
           break;
         }
-      } catch {}
+      } catch (e) {
+        log(`set date "${val}" error:`, String(e));
+      }
     }
     if (!dateOk) {
-      // Last resort: simulasi typing
-      dateInput.focus();
-      try { dateInput.select?.(); } catch {}
-      const val = dateCandidates[0];
-      setNativeValue(dateInput, val);
+      log("WARN: semua format tanggal gagal di-set");
     }
 
     // Set waktu
-    timeInput.focus();
-    setNativeValue(timeInput, `${HH}:${MM}`);
+    const timeVal = `${HH}:${MM}`;
+    fillTextField(timeInput, timeVal);
+    await sleep(180);
+    log(`set time "${timeVal}" -> input.value="${timeInput.value || ""}"`);
 
     // Blur agar form mendaftarkan perubahan
-    dateInput.dispatchEvent(new Event("blur", { bubbles: true }));
-    timeInput.dispatchEvent(new Event("blur", { bubbles: true }));
-    await sleep(150);
+    try {
+      dateInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+      timeInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+      // Beberapa picker butuh Enter untuk commit
+      dateInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+      timeInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+    } catch {}
+    await sleep(200);
   }
 
   /** Klik tombol "Perbarui" di popover */
@@ -1178,9 +1235,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.10.0",
+      version: "1.11.0",
     };
   };
 
-  log("content script loaded v1.10.0 on", location.href);
+  log("content script loaded v1.11.0 on", location.href);
 })();
