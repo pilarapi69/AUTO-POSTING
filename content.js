@@ -258,22 +258,123 @@
     return !rowHasMedia(row) && !rowHasText(row);
   }
 
-  /** Cari input[type=file] yang relevan untuk row ini.
-   *  Strategi:
-   *   1. Cari di dalam DOM row
-   *   2. Click "Tambahkan foto/video" dengan hook pada HTMLInputElement.prototype.click +
-   *      MutationObserver untuk mendeteksi input baru yang ter-mount global
-   *   3. (Fallback) jika overlay/modal muncul, klik "Pilih dari komputer" / "From your computer"
-   */
-  async function findFileInputForRow(row, { timeout = 10000 } = {}) {
-    // 1) row-scoped
-    const inRow = row.querySelector('input[type="file"]');
-    if (inRow) return inRow;
+  /** Set file ke input + dispatch change ala React */
+  function setInputFiles(input, files) {
+    const dt = new DataTransfer();
+    for (const f of files) dt.items.add(f);
+    const proto = HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "files")?.set;
+    if (setter) setter.call(input, dt.files);
+    else input.files = dt.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
 
-    // 2) click hook + mutation observer
-    return await new Promise((resolve, reject) => {
+  /** Simulasi drag-drop file ke elemen target. Banyak composer Meta menerima drop event. */
+  function dispatchDropOnElement(target, files) {
+    const dt = new DataTransfer();
+    for (const f of files) dt.items.add(f);
+    const rect = target.getBoundingClientRect();
+    const x = rect.left + rect.width / 2;
+    const y = rect.top + rect.height / 2;
+    const make = (type) =>
+      new DragEvent(type, {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        dataTransfer: dt,
+        clientX: x,
+        clientY: y,
+      });
+    target.dispatchEvent(make("dragenter"));
+    target.dispatchEvent(make("dragover"));
+    target.dispatchEvent(make("drop"));
+  }
+
+  /** Cari modal aktif (yang baru ditambahkan ke DOM) */
+  function findActiveModal() {
+    // role=dialog terlebih dulu
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+    // Filter yang visible & on-top
+    const visible = dialogs.filter((d) => {
+      const r = d.getBoundingClientRect();
+      return r.width > 100 && r.height > 100 && d.offsetParent !== null;
+    });
+    if (visible.length) {
+      // ambil yang terakhir di doc order
+      visible.sort((a, b) => {
+        const pos = a.compareDocumentPosition(b);
+        if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        return 0;
+      });
+      return visible[visible.length - 1];
+    }
+    return null;
+  }
+
+  /** Klik tombol "Tambahkan foto/video" di row dan tunggu modal terbuka */
+  async function clickAddMediaButton(row) {
+    const addBtn = findAllByText("Tambahkan foto/video", { root: row })[0];
+    if (!addBtn) throw new Error("Tombol 'Tambahkan foto/video' tidak ditemukan di row");
+    const clickable = climbToClickable(addBtn);
+    log("klik tombol Tambahkan foto/video");
+    realClick(clickable);
+    return clickable;
+  }
+
+  /** Coba klik tombol upload di dalam modal aktif */
+  async function clickUploadInModal(modal) {
+    const uploadKeywords = [
+      "Pilih dari komputer",
+      "Unggah dari komputer",
+      "Pilih file",
+      "Pilih foto",
+      "Unggah foto",
+      "Unggah video",
+      "Tambahkan foto/video",
+      "Tambahkan foto",
+      "Tambahkan video",
+      "Upload from computer",
+      "From your computer",
+      "Choose from computer",
+      "Browse",
+      "Telusuri",
+      "Unggah",
+      "Upload",
+    ];
+    for (const kw of uploadKeywords) {
+      const els = findAllByText(kw, { root: modal });
+      if (els.length) {
+        els.sort((a, b) => depth(b) - depth(a));
+        const target = climbToClickable(els[0]);
+        log(`klik kandidat upload di modal: "${kw}"`);
+        realClick(target);
+        return kw;
+      }
+    }
+    return null;
+  }
+
+  /** Dump isi modal/halaman untuk diagnosis */
+  function dumpModalState() {
+    const modal = findActiveModal();
+    const fileInputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    const buttons = modal
+      ? Array.from(modal.querySelectorAll('button, [role="button"]')).map((b) => ({
+          text: (b.innerText || "").trim().substring(0, 60),
+          aria: b.getAttribute("aria-label"),
+        }))
+      : null;
+    return { modalFound: !!modal, buttons, fileInputCount: fileInputs.length };
+  }
+
+  /** Cari input[type=file] dengan watcher (click hook + mutation observer) */
+  function watchForFileInput({ timeout = 8000 } = {}) {
+    return new Promise((resolve, reject) => {
       let done = false;
       const origClick = HTMLInputElement.prototype.click;
+      const before = new Set(document.querySelectorAll('input[type="file"]'));
 
       const cleanup = () => {
         try { HTMLInputElement.prototype.click = origClick; } catch {}
@@ -288,17 +389,13 @@
         resolve(input);
       };
 
-      // Patch prototype: intercept ketika halaman memanggil input.click()
       HTMLInputElement.prototype.click = function () {
         if (!done && this.type === "file") {
           finish(this, "prototype-click hook");
-          return; // suppress OS file dialog
+          return;
         }
         return origClick.call(this);
       };
-
-      // Snapshot input file global sebelum klik (agar bisa deteksi yang baru)
-      const before = new Set(document.querySelectorAll('input[type="file"]'));
 
       const observer = new MutationObserver((mutations) => {
         for (const m of mutations) {
@@ -317,106 +414,122 @@
       });
       observer.observe(document.body, { childList: true, subtree: true });
 
-      const timer = setTimeout(async () => {
-        if (done) return;
-        // 3) Fallback: cek apakah ada overlay "Pilih dari komputer" / dialog upload
-        const uploadKeywords = [
-          "Pilih dari komputer",
-          "Unggah dari komputer",
-          "Unggah",
-          "Upload from computer",
-          "From your computer",
-          "Upload",
-        ];
-        let clickedUpload = false;
-        for (const kw of uploadKeywords) {
-          const els = findAllByText(kw);
-          if (els.length) {
-            // pilih yg paling kecil (deepest)
-            els.sort((a, b) => depth(b) - depth(a));
-            const target = climbToClickable(els[0]);
-            log(`mencoba klik fallback upload: "${kw}"`);
-            realClick(target);
-            clickedUpload = true;
-            break;
-          }
-        }
-        if (clickedUpload) {
-          // beri waktu mount input baru
-          await sleep(800);
-          // observer & hook tetap aktif sebentar lagi
-          setTimeout(() => {
-            if (done) return;
-            // Cek snapshot ulang
-            const all = Array.from(document.querySelectorAll('input[type="file"]'));
-            const fresh = all.filter((i) => !before.has(i));
-            if (fresh.length) finish(fresh[0], "after fallback upload click");
-            else {
-              cleanup();
-              if (!done) {
-                done = true;
-                reject(
-                  new Error(
-                    "Timeout menunggu file input ter-mount (" +
-                      timeout +
-                      "ms). Fallback klik upload sudah dicoba."
-                  )
-                );
-              }
-            }
-          }, 1500);
-        } else {
-          cleanup();
+      const timer = setTimeout(() => {
+        if (!done) {
           done = true;
-          reject(
-            new Error(
-              "Timeout menunggu file input ter-mount (" +
-                timeout +
-                "ms). Klik 'Tambahkan foto/video' tidak men-trigger input.click()."
-            )
-          );
+          cleanup();
+          // resolve null tanpa reject biar caller bisa lanjut
+          resolve(null);
         }
       }, timeout);
-
-      // Trigger button "Tambahkan foto/video" di row
-      const addBtn = findAllByText("Tambahkan foto/video", { root: row })[0];
-      if (!addBtn) {
-        cleanup();
-        done = true;
-        reject(new Error("Tombol 'Tambahkan foto/video' tidak ditemukan di row"));
-        return;
-      }
-      const clickable = climbToClickable(addBtn);
-      log("klik tombol Tambahkan foto/video");
-      realClick(clickable);
     });
   }
 
-  /** Set file ke input + dispatch change ala React */
-  function setInputFiles(input, files) {
-    const dt = new DataTransfer();
-    for (const f of files) dt.items.add(f);
-    const proto = HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(proto, "files")?.set;
-    if (setter) setter.call(input, dt.files);
-    else input.files = dt.files;
-    input.dispatchEvent(new Event("change", { bubbles: true }));
-    input.dispatchEvent(new Event("input", { bubbles: true }));
+  /** Upload file untuk row. Strategi berlapis:
+   *   A) Drag-drop ke row (paling sering work pada composer Meta)
+   *   B) Klik "Tambahkan foto/video" + watch input.click hook + mutation observer (5s)
+   *   C) Klik tombol upload di dalam modal aktif (jika muncul) + watch (5s)
+   *   D) Cari input[type=file] global pertama dan force set
+   */
+  async function uploadFilesToRow(row, files) {
+    const beforeRowHasMedia = rowHasMedia(row);
+
+    // === Strategy A: Drag-drop ===
+    log("strategi A: drag-drop ke row");
+    try {
+      dispatchDropOnElement(row, files);
+      const ok = await waitFor(() => rowHasMedia(row) && !beforeRowHasMedia, {
+        timeout: 6000,
+        interval: 200,
+        label: "preview media (drag-drop)",
+      }).then(() => true).catch(() => false);
+      if (ok) {
+        log("strategi A berhasil");
+        return;
+      }
+    } catch (e) {
+      log("strategi A error: " + e.message);
+    }
+
+    // === Strategy B: Klik tombol + watch ===
+    log("strategi B: klik 'Tambahkan foto/video' + watch file input");
+    const watcherB = watchForFileInput({ timeout: 5000 });
+    try {
+      await clickAddMediaButton(row);
+    } catch (e) {
+      throw new Error(e.message);
+    }
+    const inputB = await watcherB;
+    if (inputB) {
+      setInputFiles(inputB, files);
+      log(`strategi B: ${files.length} file dikirim ke input`);
+      try {
+        await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
+      } catch (e) {
+        log("warning preview media: " + e.message);
+      }
+      // Close any leftover modal
+      pressEscape();
+      return;
+    }
+
+    // === Strategy C: Modal sudah muncul, klik tombol upload di dalamnya ===
+    const modal = findActiveModal();
+    if (modal) {
+      log("strategi C: modal terdeteksi, mencoba klik upload di modal");
+      const watcherC = watchForFileInput({ timeout: 6000 });
+      const clicked = await clickUploadInModal(modal);
+      if (clicked) {
+        const inputC = await watcherC;
+        if (inputC) {
+          setInputFiles(inputC, files);
+          log(`strategi C: ${files.length} file dikirim ke input via "${clicked}"`);
+          try {
+            await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
+          } catch (e) {
+            log("warning preview media: " + e.message);
+          }
+          pressEscape();
+          return;
+        }
+      } else {
+        log("strategi C: tidak menemukan tombol upload di dalam modal");
+      }
+    }
+
+    // === Strategy D: input file global pertama ===
+    const anyInput = document.querySelector('input[type="file"]');
+    if (anyInput) {
+      log("strategi D: force-set ke input[type=file] global pertama");
+      setInputFiles(anyInput, files);
+      try {
+        await waitFor(() => rowHasMedia(row), { timeout: 15000, label: "preview media (global input)" });
+        pressEscape();
+        return;
+      } catch (e) {
+        log("strategi D gagal: preview tidak muncul");
+      }
+    }
+
+    // Dump diagnosis ke console untuk dilihat user
+    const diag = dumpModalState();
+    log("DIAGNOSIS upload gagal:", diag);
+    pressEscape();
+    throw new Error(
+      "Gagal upload media (semua strategi). Modal: " +
+        (diag.modalFound ? "YA (" + (diag.buttons?.length || 0) + " tombol)" : "TIDAK") +
+        ", file inputs: " +
+        diag.fileInputCount +
+        ". Lihat console untuk detail tombol."
+    );
   }
 
-  /** Upload file untuk row */
-  async function uploadFilesToRow(row, files) {
-    const input = await findFileInputForRow(row, { timeout: 10000 });
-    setInputFiles(input, files);
-    log(`set ${files.length} file ke input (name=${input.name || "-"}, accept=${input.accept || "-"})`);
-    // Tunggu hingga preview muncul atau overlay tertutup
+  function pressEscape() {
     try {
-      await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
-    } catch (e) {
-      log("warning: preview media belum terdeteksi, lanjut: " + e.message);
-    }
-    // Jika ada overlay/modal yang masih terbuka karena fallback, tutup ESC
-    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      const opts = { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true };
+      document.body.dispatchEvent(new KeyboardEvent("keydown", opts));
+      document.body.dispatchEvent(new KeyboardEvent("keyup", opts));
+    } catch {}
   }
 
   /** Isi caption ke row */
@@ -724,9 +837,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.1.0",
+      version: "1.2.0",
     };
   };
 
-  log("content script loaded v1.1.0 on", location.href);
+  log("content script loaded v1.2.0 on", location.href);
 })();
