@@ -163,6 +163,154 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
+  // Upload kombo: patch HTMLInputElement.prototype.click di MAIN world,
+  // klik tombol "Tambahkan foto/video", intercept input.click() yg dipanggil halaman,
+  // set files via DataTransfer + dispatch change, lalu restore.
+  // Semua dalam satu execution agar atomik.
+  if (msg.type === "UPLOAD_VIA_BUTTON_CLICK") {
+    const tabId = msg.tabId || sender.tab?.id;
+    const buttonSelector = msg.buttonSelector;
+    const fileSpecs = msg.files;
+    const interceptTimeoutMs = msg.interceptTimeoutMs || 5000;
+    if (!tabId || !buttonSelector || !Array.isArray(fileSpecs)) {
+      sendResponse({ ok: false, error: "missing tabId/buttonSelector/files" });
+      return;
+    }
+    chrome.scripting
+      .executeScript({
+        target: { tabId },
+        world: "MAIN",
+        func: (btnSel, specs, timeoutMs) => {
+          return new Promise((resolve) => {
+            const origClick = HTMLInputElement.prototype.click;
+            let done = false;
+            const log = (...a) => {
+              try { console.log("[AutoPosting:main]", ...a); } catch {}
+            };
+            const cleanup = () => {
+              try { HTMLInputElement.prototype.click = origClick; } catch {}
+            };
+            const finish = (result) => {
+              if (done) return;
+              done = true;
+              cleanup();
+              resolve(result);
+            };
+
+            function b64ToBytes(b64) {
+              const bin = atob(b64);
+              const len = bin.length;
+              const bytes = new Uint8Array(len);
+              for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
+              return bytes;
+            }
+            function buildFiles() {
+              const dt = new DataTransfer();
+              for (const s of specs) {
+                const bytes = b64ToBytes(s.b64);
+                const blob = new Blob([bytes], { type: s.type || "application/octet-stream" });
+                const file = new File([blob], s.name, {
+                  type: blob.type,
+                  lastModified: s.lastModified || Date.now(),
+                });
+                dt.items.add(file);
+              }
+              return dt;
+            }
+            function setFilesOn(input) {
+              try {
+                const dt = buildFiles();
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "files")?.set;
+                if (setter) setter.call(input, dt.files);
+                else input.files = dt.files;
+                input.dispatchEvent(new Event("change", { bubbles: true }));
+                input.dispatchEvent(new Event("input", { bubbles: true }));
+                return { ok: true, count: dt.files.length };
+              } catch (e) {
+                return { ok: false, error: String(e) };
+              }
+            }
+
+            // Patch prototype.click — intercept saat halaman panggil input.click()
+            HTMLInputElement.prototype.click = function () {
+              if (!done && this.type === "file") {
+                log("intercepted input.click()", { name: this.name, accept: this.accept });
+                const res = setFilesOn(this);
+                if (res.ok) {
+                  finish({ ok: true, intercepted: true, source: "prototype-click", inputAccept: this.accept || null, count: res.count });
+                } else {
+                  finish({ ok: false, intercepted: true, source: "prototype-click", error: res.error });
+                }
+                return; // suppress OS dialog
+              }
+              return origClick.call(this);
+            };
+
+            // Juga pasang MutationObserver: kalau halaman mount input baru tanpa panggil .click()
+            const beforeInputs = new Set(document.querySelectorAll('input[type="file"]'));
+            const observer = new MutationObserver(() => {
+              if (done) return;
+              const all = Array.from(document.querySelectorAll('input[type="file"]'));
+              for (const inp of all) {
+                if (!beforeInputs.has(inp)) {
+                  log("mutation observer found new file input");
+                  const res = setFilesOn(inp);
+                  observer.disconnect();
+                  if (res.ok) finish({ ok: true, intercepted: false, source: "mutation-observer", count: res.count });
+                  else finish({ ok: false, intercepted: false, source: "mutation-observer", error: res.error });
+                  return;
+                }
+              }
+            });
+            try { observer.observe(document.body, { childList: true, subtree: true }); } catch {}
+
+            const btn = document.querySelector(btnSel);
+            if (!btn) {
+              try { observer.disconnect(); } catch {}
+              return finish({ ok: false, error: "button not found in main world: " + btnSel });
+            }
+
+            // Full event sequence + native .click()
+            try {
+              const rect = btn.getBoundingClientRect();
+              const cx = rect.left + rect.width / 2;
+              const cy = rect.top + rect.height / 2;
+              const opts = {
+                bubbles: true, cancelable: true, composed: true, view: window,
+                clientX: cx, clientY: cy, screenX: cx, screenY: cy,
+                button: 0, buttons: 1, detail: 1,
+              };
+              const popts = { ...opts, pointerType: "mouse", pointerId: 1, isPrimary: true, pressure: 0.5 };
+              btn.dispatchEvent(new PointerEvent("pointerover", popts));
+              btn.dispatchEvent(new PointerEvent("pointerenter", popts));
+              btn.dispatchEvent(new MouseEvent("mouseover", opts));
+              btn.dispatchEvent(new MouseEvent("mouseenter", opts));
+              btn.dispatchEvent(new PointerEvent("pointerdown", popts));
+              btn.dispatchEvent(new MouseEvent("mousedown", opts));
+              btn.dispatchEvent(new PointerEvent("pointerup", popts));
+              btn.dispatchEvent(new MouseEvent("mouseup", opts));
+              btn.dispatchEvent(new MouseEvent("click", opts));
+              try { btn.focus?.(); } catch {}
+              try { btn.click(); } catch {}
+            } catch (e) {
+              log("button click error:", String(e));
+            }
+
+            setTimeout(() => {
+              if (!done) {
+                try { observer.disconnect(); } catch {}
+                finish({ ok: false, error: "input.click() tidak ter-intercept dalam " + timeoutMs + "ms" });
+              }
+            }, timeoutMs);
+          });
+        },
+        args: [buttonSelector, fileSpecs, interceptTimeoutMs],
+      })
+      .then((res) => sendResponse({ ok: true, res }))
+      .catch((err) => sendResponse({ ok: false, error: String(err) }));
+    return true;
+  }
+
   // Drop files di MAIN world (untuk trusted DragEvent)
   if (msg.type === "DROP_FILES_IN_MAIN_WORLD") {
     const tabId = msg.tabId || sender.tab?.id;

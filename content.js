@@ -207,6 +207,34 @@
     }
   }
 
+  /** Klik tombol upload + intercept input.click() di MAIN world (combo atomik). */
+  async function uploadViaButtonClickMainWorld(button, files, opts = {}) {
+    if (!button) return { ok: false, error: "button null" };
+    const tag = "__ap_upload_" + Math.random().toString(36).slice(2);
+    button.setAttribute("data-ap-upload", tag);
+    try {
+      const specs = await filesToSpecs(files);
+      const res = await chrome.runtime.sendMessage({
+        type: "UPLOAD_VIA_BUTTON_CLICK",
+        buttonSelector: '[data-ap-upload="' + tag + '"]',
+        files: specs,
+        interceptTimeoutMs: opts.timeout || 6000,
+      });
+      log("upload-via-button-click result:", res?.res);
+      // res = { ok: true, res: [{ frameId, result: {...} }] }
+      const frameResult = res?.res?.[0]?.result;
+      if (frameResult && frameResult.ok) {
+        return { ok: true, source: frameResult.source, count: frameResult.count };
+      }
+      return { ok: false, error: frameResult?.error || "unknown error" };
+    } catch (e) {
+      log("upload-via-button-click error:", String(e));
+      return { ok: false, error: String(e) };
+    } finally {
+      try { button.removeAttribute("data-ap-upload"); } catch {}
+    }
+  }
+
   /** Dispatch trusted drop di MAIN world. */
   async function dropFilesInMainWorld(target, files) {
     if (!target) return false;
@@ -420,14 +448,11 @@
     return null;
   }
 
-  /** Klik tombol "Tambahkan foto/video" di row dan tunggu modal terbuka */
-  async function clickAddMediaButton(row) {
-    const addBtn = findAllByText("Tambahkan foto/video", { root: row })[0];
-    if (!addBtn) throw new Error("Tombol 'Tambahkan foto/video' tidak ditemukan di row");
-    const clickable = climbToClickable(addBtn);
-    log("ultraClick Tambahkan foto/video");
-    await ultraClick(clickable);
-    return clickable;
+  /** Cari tombol "Tambahkan foto/video" yang clickable di row (deepest text element → climb ke role=button). */
+  function findAddMediaButton(row) {
+    const addBtn = findInnermostByText("Tambahkan foto/video", { root: row });
+    if (!addBtn) return null;
+    return climbToClickable(addBtn);
   }
 
   /** Coba klik tombol upload di dalam modal aktif */
@@ -529,69 +554,72 @@
     }
   }
 
-  /** Upload file untuk row. Strategi (semua via MAIN world):
-   *   1) ultraClick "Tambahkan foto/video" + watch input baru ter-mount
-   *   2) Kalau muncul modal, ultraClick tombol upload di dalam modal + watch lagi
-   *   3) Set files ke input via main-world DataTransfer
-   *   4) Fallback: setFilesInMainWorld ke input[type=file] global pertama
-   *   5) Fallback terakhir: dropFilesInMainWorld ke row container
+  /** Upload file untuk row. Strategi utama: UPLOAD_VIA_BUTTON_CLICK (combo main-world).
+   *   1) Cari tombol "Tambahkan foto/video" di row → patch prototype.click di main world
+   *      → klik tombol → intercept input.click() → set files via DataTransfer + dispatch change
+   *   2) Fallback: kalau ada modal upload di dalam, klik tombol upload di modal & ulang flow
+   *   3) Fallback terakhir: drop files trusted via main world
    */
   async function uploadFilesToRow(row, files) {
-    const beforeInputCount = document.querySelectorAll('input[type="file"]').length;
+    // === Step 1: combo main-world ===
+    const addBtn = findAddMediaButton(row);
+    if (!addBtn) throw new Error("Tombol 'Tambahkan foto/video' tidak ditemukan di row");
 
-    // === Step 1: ultraClick "Tambahkan foto/video" + watch ===
-    log("step 1: ultraClick 'Tambahkan foto/video' + watch file input");
-    const watcher1 = watchForFileInput({ timeout: 5000 });
-    await clickAddMediaButton(row);
-    let input = await watcher1;
+    log("step 1: UPLOAD_VIA_BUTTON_CLICK (combo main-world)");
+    let res = await uploadViaButtonClickMainWorld(addBtn, files, { timeout: 6000 });
+    if (res.ok) {
+      log(`step 1 berhasil via ${res.source}, ${res.count} file`);
+      try {
+        await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
+      } catch (e) {
+        log("warning preview media: " + e.message);
+      }
+      pressEscape();
+      return;
+    }
+    log("step 1 gagal: " + res.error);
 
-    // === Step 2: Kalau modal terbuka tapi belum ada input file, klik tombol upload ===
-    if (!input) {
-      const modal = findActiveModal();
-      if (modal) {
-        log("step 2: modal terdeteksi, mencoba klik tombol upload");
-        const watcher2 = watchForFileInput({ timeout: 7000 });
-        const clicked = await clickUploadInModal(modal);
-        if (clicked) {
-          input = await watcher2;
-        } else {
-          log("step 2: tidak menemukan kandidat tombol upload");
+    // === Step 2: cek modal, klik tombol upload di dalam modal, ulangi ===
+    const modal = findActiveModal();
+    if (modal) {
+      log("step 2: modal terdeteksi setelah step 1, scan tombol upload");
+      const uploadKeywords = [
+        "Pilih dari komputer",
+        "Unggah dari komputer",
+        "Pilih file",
+        "Pilih foto",
+        "Unggah foto",
+        "Unggah video",
+        "Upload from computer",
+        "From your computer",
+        "Choose from computer",
+        "Browse",
+        "Telusuri",
+        "Unggah",
+        "Upload",
+      ];
+      for (const kw of uploadKeywords) {
+        const els = findAllByText(kw, { root: modal });
+        if (!els.length) continue;
+        els.sort((a, b) => depth(b) - depth(a));
+        const target = climbToClickable(els[0]);
+        log(`step 2: coba kombo via tombol modal "${kw}"`);
+        res = await uploadViaButtonClickMainWorld(target, files, { timeout: 6000 });
+        if (res.ok) {
+          log(`step 2 berhasil via ${res.source}, ${res.count} file`);
+          try {
+            await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
+          } catch (e) {
+            log("warning preview media: " + e.message);
+          }
+          pressEscape();
+          return;
         }
       }
     }
 
-    // === Step 3: Set files ke input yang ketemu ===
-    if (input) {
-      await setFilesEverywhere(input, files);
-      log(`${files.length} file dikirim ke input`);
-      try {
-        await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
-        pressEscape();
-        return;
-      } catch (e) {
-        log("warning preview media: " + e.message);
-        pressEscape();
-        return;
-      }
-    }
-
-    // === Step 4: Force ke input global pertama ===
-    const allInputs = Array.from(document.querySelectorAll('input[type="file"]'));
-    if (allInputs.length > beforeInputCount) {
-      const fresh = allInputs[allInputs.length - 1];
-      log("step 4: force-set ke input[type=file] terbaru");
-      await setFilesEverywhere(fresh, files);
-      try {
-        await waitFor(() => rowHasMedia(row), { timeout: 15000, label: "preview media (global input)" });
-        pressEscape();
-        return;
-      } catch (e) {
-        log("step 4 gagal: " + e.message);
-      }
-    }
-
-    // === Step 5: Drag-drop trusted via main world ===
-    log("step 5: drag-drop trusted via main world");
+    // === Step 3: drag-drop trusted ke row ===
+    log("step 3: drag-drop trusted via main world");
     const dropOk = await dropFilesInMainWorld(row, files);
     if (dropOk) {
       try {
@@ -599,20 +627,22 @@
         pressEscape();
         return;
       } catch (e) {
-        log("step 5 preview tidak muncul: " + e.message);
+        log("step 3 preview tidak muncul: " + e.message);
       }
     }
 
-    // Diagnosis
+    // Diagnosis akhir
     const diag = dumpModalState();
     log("DIAGNOSIS upload gagal:", diag);
     pressEscape();
     throw new Error(
-      "Gagal upload media (semua strategi). Modal: " +
+      "Gagal upload media. Modal: " +
         (diag.modalFound ? "YA (" + (diag.buttons?.length || 0) + " tombol)" : "TIDAK") +
         ", file inputs di DOM: " +
         diag.fileInputCount +
-        ". Cek console untuk detail tombol modal."
+        ". Detail: " +
+        (res?.error || "-") +
+        ". Cek console."
     );
   }
 
@@ -929,9 +959,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.3.0",
+      version: "1.4.0",
     };
   };
 
-  log("content script loaded v1.3.0 on", location.href);
+  log("content script loaded v1.4.0 on", location.href);
 })();
