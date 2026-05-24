@@ -132,20 +132,31 @@
     el.dispatchEvent(new MouseEvent("click", opts));
   }
 
-  /** Cari kontainer baris (row) postingan berdasarkan keberadaan tombol Tambahkan foto/video */
+  /** Cari kontainer baris (row) postingan.
+   *  Strategi: setiap textarea dengan placeholder "Tulis sesuatu..." = satu row.
+   *  Container row = ancestor terkecil yang juga berisi tombol "Tambahkan foto/video".
+   *  Fallback: anchor dari tombol "Tambahkan foto/video" jika tidak ada textarea (mis. UI bahasa lain).
+   */
   function getPostRows() {
-    const buttons = findAllByText("Tambahkan foto/video");
     /** @type {HTMLElement[]} */
     const rows = [];
     const seen = new Set();
-    for (const b of buttons) {
-      // Naik beberapa level mencari kontainer baris (heuristik: parent yang juga punya teks "Tulis sesuatu..." atau "Terbitkan")
-      let n = b;
-      for (let i = 0; i < 12 && n && n !== document.body; i++) {
-        if (
-          n.querySelector?.("textarea, [contenteditable='true']") ||
-          (n.innerText && n.innerText.toLowerCase().includes("terbitkan"))
-        ) {
+
+    const textareas = Array.from(document.querySelectorAll("textarea")).filter((ta) => {
+      const ph = (ta.placeholder || "").toLowerCase();
+      // utamakan placeholder "tulis sesuatu", tapi terima juga textarea lain yg terlihat
+      const rect = ta.getBoundingClientRect();
+      const visible = rect.width > 100 && rect.height > 20;
+      return visible && (ph.includes("tulis sesuatu") || ph.includes("write") || ph === "");
+    });
+
+    const addMediaButtons = findAllByText("Tambahkan foto/video");
+
+    for (const ta of textareas) {
+      let n = ta;
+      for (let i = 0; i < 25 && n && n !== document.body; i++) {
+        const containsAddMedia = addMediaButtons.some((b) => n.contains(b));
+        if (containsAddMedia) {
           if (!seen.has(n)) {
             seen.add(n);
             rows.push(n);
@@ -155,8 +166,37 @@
         n = n.parentElement;
       }
     }
-    // Sort berdasarkan urutan visual (top)
-    rows.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+
+    // Fallback: gunakan tombol "Tambahkan foto/video" sebagai anchor
+    if (!rows.length) {
+      for (const b of addMediaButtons) {
+        let n = b;
+        for (let i = 0; i < 25 && n && n !== document.body; i++) {
+          if (
+            n.querySelector?.("textarea, [contenteditable='true']") ||
+            (n.innerText && n.innerText.toLowerCase().includes("terbitkan"))
+          ) {
+            if (!seen.has(n)) {
+              seen.add(n);
+              rows.push(n);
+            }
+            break;
+          }
+          n = n.parentElement;
+        }
+      }
+    }
+
+    // Sort by visual top (fallback to doc order)
+    rows.sort((a, b) => {
+      const ar = a.getBoundingClientRect();
+      const br = b.getBoundingClientRect();
+      if (ar.top !== br.top) return ar.top - br.top;
+      const pos = a.compareDocumentPosition(b);
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
     return rows;
   }
 
@@ -189,17 +229,18 @@
   /** Apakah row sudah memiliki media (preview) */
   function rowHasMedia(row) {
     if (!row) return false;
-    // heuristik: ada img/preview di area Media, dan tombol "Tambahkan foto/video" mungkin masih ada
+    // heuristik 1: ada img/video preview di area row
     const imgs = row.querySelectorAll("img");
     for (const img of imgs) {
-      // hindari avatar (kecil)
       const r = img.getBoundingClientRect();
       if (r.width >= 40 && r.height >= 40 && !img.src.includes("static.xx.fbcdn")) {
         return true;
       }
     }
-    // cek video preview
     if (row.querySelector("video")) return true;
+    // heuristik 2: tombol "Tambahkan foto/video" hilang dari row → media sudah ada
+    const stillHasAddBtn = findAllByText("Tambahkan foto/video", { root: row }).length > 0;
+    if (!stillHasAddBtn) return true;
     return false;
   }
 
@@ -217,26 +258,165 @@
     return !rowHasMedia(row) && !rowHasText(row);
   }
 
-  /** Upload file ke input[type=file] dalam row */
-  async function uploadFilesToRow(row, files) {
-    const input = await waitFor(() => row.querySelector('input[type="file"]'), {
-      timeout: 8000, label: "input file pada row",
+  /** Cari input[type=file] yang relevan untuk row ini.
+   *  Strategi:
+   *   1. Cari di dalam DOM row
+   *   2. Click "Tambahkan foto/video" dengan hook pada HTMLInputElement.prototype.click +
+   *      MutationObserver untuk mendeteksi input baru yang ter-mount global
+   *   3. (Fallback) jika overlay/modal muncul, klik "Pilih dari komputer" / "From your computer"
+   */
+  async function findFileInputForRow(row, { timeout = 10000 } = {}) {
+    // 1) row-scoped
+    const inRow = row.querySelector('input[type="file"]');
+    if (inRow) return inRow;
+
+    // 2) click hook + mutation observer
+    return await new Promise((resolve, reject) => {
+      let done = false;
+      const origClick = HTMLInputElement.prototype.click;
+
+      const cleanup = () => {
+        try { HTMLInputElement.prototype.click = origClick; } catch {}
+        try { observer.disconnect(); } catch {}
+        clearTimeout(timer);
+      };
+      const finish = (input, source) => {
+        if (done) return;
+        done = true;
+        cleanup();
+        log(`file input ditemukan via ${source}`);
+        resolve(input);
+      };
+
+      // Patch prototype: intercept ketika halaman memanggil input.click()
+      HTMLInputElement.prototype.click = function () {
+        if (!done && this.type === "file") {
+          finish(this, "prototype-click hook");
+          return; // suppress OS file dialog
+        }
+        return origClick.call(this);
+      };
+
+      // Snapshot input file global sebelum klik (agar bisa deteksi yang baru)
+      const before = new Set(document.querySelectorAll('input[type="file"]'));
+
+      const observer = new MutationObserver((mutations) => {
+        for (const m of mutations) {
+          for (const node of m.addedNodes) {
+            if (node.nodeType !== 1) continue;
+            const el = /** @type {Element} */ (node);
+            const found =
+              (el.matches?.('input[type="file"]') ? el : null) ||
+              el.querySelector?.('input[type="file"]');
+            if (found && !before.has(found)) {
+              finish(/** @type {HTMLInputElement} */ (found), "mutation observer");
+              return;
+            }
+          }
+        }
+      });
+      observer.observe(document.body, { childList: true, subtree: true });
+
+      const timer = setTimeout(async () => {
+        if (done) return;
+        // 3) Fallback: cek apakah ada overlay "Pilih dari komputer" / dialog upload
+        const uploadKeywords = [
+          "Pilih dari komputer",
+          "Unggah dari komputer",
+          "Unggah",
+          "Upload from computer",
+          "From your computer",
+          "Upload",
+        ];
+        let clickedUpload = false;
+        for (const kw of uploadKeywords) {
+          const els = findAllByText(kw);
+          if (els.length) {
+            // pilih yg paling kecil (deepest)
+            els.sort((a, b) => depth(b) - depth(a));
+            const target = climbToClickable(els[0]);
+            log(`mencoba klik fallback upload: "${kw}"`);
+            realClick(target);
+            clickedUpload = true;
+            break;
+          }
+        }
+        if (clickedUpload) {
+          // beri waktu mount input baru
+          await sleep(800);
+          // observer & hook tetap aktif sebentar lagi
+          setTimeout(() => {
+            if (done) return;
+            // Cek snapshot ulang
+            const all = Array.from(document.querySelectorAll('input[type="file"]'));
+            const fresh = all.filter((i) => !before.has(i));
+            if (fresh.length) finish(fresh[0], "after fallback upload click");
+            else {
+              cleanup();
+              if (!done) {
+                done = true;
+                reject(
+                  new Error(
+                    "Timeout menunggu file input ter-mount (" +
+                      timeout +
+                      "ms). Fallback klik upload sudah dicoba."
+                  )
+                );
+              }
+            }
+          }, 1500);
+        } else {
+          cleanup();
+          done = true;
+          reject(
+            new Error(
+              "Timeout menunggu file input ter-mount (" +
+                timeout +
+                "ms). Klik 'Tambahkan foto/video' tidak men-trigger input.click()."
+            )
+          );
+        }
+      }, timeout);
+
+      // Trigger button "Tambahkan foto/video" di row
+      const addBtn = findAllByText("Tambahkan foto/video", { root: row })[0];
+      if (!addBtn) {
+        cleanup();
+        done = true;
+        reject(new Error("Tombol 'Tambahkan foto/video' tidak ditemukan di row"));
+        return;
+      }
+      const clickable = climbToClickable(addBtn);
+      log("klik tombol Tambahkan foto/video");
+      realClick(clickable);
     });
+  }
+
+  /** Set file ke input + dispatch change ala React */
+  function setInputFiles(input, files) {
     const dt = new DataTransfer();
     for (const f of files) dt.items.add(f);
-    // Set files via descriptor
     const proto = HTMLInputElement.prototype;
     const setter = Object.getOwnPropertyDescriptor(proto, "files")?.set;
     if (setter) setter.call(input, dt.files);
     else input.files = dt.files;
     input.dispatchEvent(new Event("change", { bubbles: true }));
-    // Tunggu hingga preview muncul
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+
+  /** Upload file untuk row */
+  async function uploadFilesToRow(row, files) {
+    const input = await findFileInputForRow(row, { timeout: 10000 });
+    setInputFiles(input, files);
+    log(`set ${files.length} file ke input (name=${input.name || "-"}, accept=${input.accept || "-"})`);
+    // Tunggu hingga preview muncul atau overlay tertutup
     try {
       await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
     } catch (e) {
-      // Tidak fatal — kadang Meta menampilkan progress saja. Lanjut.
       log("warning: preview media belum terdeteksi, lanjut: " + e.message);
     }
+    // Jika ada overlay/modal yang masih terbuka karena fallback, tutup ESC
+    document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
   }
 
   /** Isi caption ke row */
@@ -275,15 +455,17 @@
     }
     if (!btn) throw new Error("Tombol dropdown jadwal tidak ditemukan pada row");
     realClick(btn);
-    // Tunggu popover muncul (ada tab "Jadwalkan")
+    // Tunggu popover muncul (ada teks "Jadwalkan" DAN "Terbitkan sekarang")
     const popover = await waitFor(() => {
-      // popover biasanya elemen baru dengan teks "Jadwalkan" dan "Terbitkan sekarang"
-      const els = findAllByText("Jadwalkan");
-      for (const el of els) {
-        // pastikan ada saudara "Terbitkan sekarang"
-        const parent = el.closest('[role="dialog"], [role="menu"], [data-visualcompletion="ignore-dynamic"]') || el.parentElement?.parentElement;
-        if (parent && /terbitkan sekarang/i.test(parent.innerText || "")) {
-          return parent;
+      const candidates = findAllByText("Jadwalkan");
+      for (const el of candidates) {
+        let n = el;
+        for (let i = 0; i < 12 && n && n !== document.body; i++) {
+          const txt = (n.innerText || "").toLowerCase();
+          if (txt.includes("jadwalkan") && txt.includes("terbitkan sekarang")) {
+            return n;
+          }
+          n = n.parentElement;
         }
       }
       return null;
@@ -293,9 +475,11 @@
 
   /** Pilih tab "Jadwalkan" di popover */
   async function selectScheduleTab(popover) {
-    const tabs = findAllByText("Jadwalkan", { root: popover, exact: true });
+    let tabs = findAllByText("Jadwalkan", { root: popover, exact: true });
+    if (!tabs.length) tabs = findAllByText("Jadwalkan", { root: popover });
     if (!tabs.length) throw new Error("Tab Jadwalkan tidak ditemukan di popover");
-    // Cari yang clickable
+    // Pilih kandidat terdalam (paling kecil) yang clickable
+    tabs.sort((a, b) => depth(b) - depth(a));
     const clickable = climbToClickable(tabs[0]);
     realClick(clickable);
     // Tunggu field tanggal muncul
@@ -514,5 +698,35 @@
     }
   });
 
-  log("content script loaded on", location.href);
+  // ---------- Debug helper ----------
+  // Pasang di window agar user bisa cek state dari DevTools console.
+  window.__autoPostingDebug = function () {
+    const rows = getPostRows();
+    const addBtn = findAddPostButton();
+    const fileInputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    return {
+      rowCount: rows.length,
+      rows: rows.map((r, i) => ({
+        index: i,
+        rect: r.getBoundingClientRect(),
+        hasMedia: rowHasMedia(r),
+        hasText: rowHasText(r),
+        textareaPresent: !!r.querySelector("textarea"),
+        addMediaBtnPresent: findAllByText("Tambahkan foto/video", { root: r }).length > 0,
+      })),
+      addPostButton: addBtn ? { tag: addBtn.tagName, text: addBtn.innerText } : null,
+      fileInputCount: fileInputs.length,
+      fileInputs: fileInputs.map((i) => ({
+        accept: i.accept,
+        name: i.name,
+        multiple: i.multiple,
+        rect: i.getBoundingClientRect(),
+        attachedToDom: document.body.contains(i),
+      })),
+      url: location.href,
+      version: "1.1.0",
+    };
+  };
+
+  log("content script loaded v1.1.0 on", location.href);
 })();
