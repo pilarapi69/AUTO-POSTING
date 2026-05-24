@@ -117,25 +117,61 @@
     el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
   }
 
-  /** Fill teks ke input/textarea/contenteditable dengan event React-compatible.
-   *  Pakai execCommand("insertText") agar React/Lexical state ter-sync (user bisa
-   *  edit/hapus per-karakter setelahnya). Jika execCommand tidak tersedia atau
-   *  gagal, fallback ke native setter + InputEvent.
-   *  HARUS dipanggil dari context yang sudah ter-focus (kita panggil el.focus()
-   *  sebelumnya). */
-  function fillTextField(el, text) {
-    if (!el) return false;
+  /** Native setter helper (per-tag). Tracker.setValue di React menggunakan
+   *  property descriptor pada prototype. Setting via setter ini diikuti dispatch
+   *  InputEvent membuat React onChange terpicu DAN state-nya ter-sync. */
+  function setNativeProtoValue(el, value) {
+    let proto;
+    if (el instanceof HTMLTextAreaElement) proto = HTMLTextAreaElement.prototype;
+    else if (el instanceof HTMLInputElement) proto = HTMLInputElement.prototype;
+    else proto = null;
+    if (proto) {
+      const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+      if (setter) { setter.call(el, value); return true; }
+    }
+    try { el.value = value; return true; } catch { return false; }
+  }
+
+  /** Fill via paste event simulation. Lexical/contenteditable + plain textarea
+   *  keduanya respect paste event. Ini cara paling reliable untuk update state
+   *  React/Lexical karena event-nya identik dgn user paste sungguhan. */
+  function pasteIntoElement(el, text) {
     try {
       el.focus();
     } catch {}
-    // Select all existing content lalu hapus
-    try {
-      if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
-        const len = (el.value || "").length;
-        try { el.setSelectionRange?.(0, len); } catch {}
-        try { el.select?.(); } catch {}
-      } else {
-        // contenteditable
+    const dt = new DataTransfer();
+    dt.setData("text/plain", text);
+    const evt = new ClipboardEvent("paste", {
+      clipboardData: dt,
+      bubbles: true,
+      cancelable: true,
+    });
+    return el.dispatchEvent(evt);
+  }
+
+  /** Hapus seluruh isi input/textarea/contenteditable, dgn event yang React-aware. */
+  function clearTextField(el) {
+    try { el.focus(); } catch {}
+    if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
+      // Select all
+      try { el.setSelectionRange?.(0, (el.value || "").length); } catch {}
+      try { el.select?.(); } catch {}
+      // beforeinput \u2192 setter \u2192 input event chain
+      try {
+        el.dispatchEvent(new InputEvent("beforeinput", {
+          inputType: "deleteContentBackward", bubbles: true, cancelable: true,
+        }));
+      } catch {}
+      setNativeProtoValue(el, "");
+      try {
+        el.dispatchEvent(new InputEvent("input", {
+          inputType: "deleteContentBackward", bubbles: true,
+        }));
+      } catch {}
+      try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+    } else {
+      // contenteditable
+      try {
         const sel = window.getSelection();
         if (sel) {
           const range = document.createRange();
@@ -143,24 +179,77 @@
           sel.removeAllRanges();
           sel.addRange(range);
         }
-      }
-    } catch {}
-    let inserted = false;
-    try {
-      const delOk = document.execCommand("delete", false, null);
-      // Insert via execCommand (generates beforeinput + input dgn inputType=insertText)
-      inserted = document.execCommand("insertText", false, text);
-    } catch {}
-    // Verifikasi: kalau target masih kosong (insert gagal), fallback ke setter
-    const isText = el.tagName === "TEXTAREA" || el.tagName === "INPUT";
-    const currentVal = isText ? (el.value || "") : (el.textContent || "");
-    if (!inserted || currentVal !== text) {
-      if (isText) {
-        setNativeValue(el, text);
-      } else {
-        setContentEditable(el, text);
-      }
+        document.execCommand("delete", false, null);
+      } catch {}
     }
+  }
+
+  /** Fill teks ke input/textarea/contenteditable dengan event React-compatible.
+   *  Strategy: clear \u2192 paste event (Lexical-friendly) \u2192 verify \u2192 fallback chain. */
+  function fillTextField(el, text) {
+    if (!el) return false;
+    try { el.focus(); } catch {}
+
+    const isText = el.tagName === "TEXTAREA" || el.tagName === "INPUT";
+    const readVal = () => isText ? (el.value || "") : (el.textContent || "");
+
+    // Step 1: Clear existing content (jika ada)
+    clearTextField(el);
+
+    // Step 2: Try paste simulation (paling akurat utk Lexical+React)
+    pasteIntoElement(el, text);
+
+    if (readVal().includes(text)) return true;
+
+    // Step 3: beforeinput + native setter + input event (React-friendly)
+    try {
+      el.dispatchEvent(new InputEvent("beforeinput", {
+        inputType: "insertText", data: text, bubbles: true, cancelable: true,
+      }));
+    } catch {}
+    if (isText) {
+      setNativeProtoValue(el, text);
+      try {
+        el.dispatchEvent(new InputEvent("input", {
+          inputType: "insertText", data: text, bubbles: true,
+        }));
+      } catch {
+        el.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+    } else {
+      // contenteditable
+      try {
+        document.execCommand("insertText", false, text);
+      } catch {}
+      try {
+        el.dispatchEvent(new InputEvent("input", {
+          inputType: "insertText", data: text, bubbles: true,
+        }));
+      } catch {}
+    }
+
+    return true;
+  }
+
+  /** Set value ke spinbutton (role=spinbutton, biasanya untuk jam/menit Meta).
+   *  Strategy: native setter + InputEvent. Jika tidak nyangkut, pakai keyboard
+   *  arrow simulation utk increment/decrement dari nilai current ke target. */
+  function setSpinbutton(el, targetValue) {
+    if (!el) return false;
+    try { el.focus(); } catch {}
+    const t = String(targetValue);
+    // Try native setter first
+    setNativeProtoValue(el, t);
+    try {
+      el.dispatchEvent(new InputEvent("input", {
+        inputType: "insertReplacementText", data: t, bubbles: true,
+      }));
+    } catch {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+    try { el.dispatchEvent(new FocusEvent("blur", { bubbles: true })); } catch {}
     return true;
   }
 
@@ -777,13 +866,20 @@
 
   /** Isi caption ke row */
   async function fillCaptionInRow(row, caption) {
-    // Coba textarea terlebih dulu, lalu contenteditable
-    let target = row.querySelector("textarea");
-    if (!target) target = row.querySelector("[contenteditable='true']");
+    // Prioritas: rich-editor (Lexical/contenteditable) dulu, baru textarea polos.
+    // Jika hanya kita target textarea sementara Meta render placeholder via
+    // Lexical state, placeholder akan tetap tampil overlay & React state empty.
+    let target =
+      row.querySelector("[role='textbox'][contenteditable='true']") ||
+      row.querySelector("[contenteditable='true']") ||
+      row.querySelector("textarea");
     if (!target) throw new Error("Tidak menemukan input teks pada row");
+    log("fill caption target:", target.tagName,
+        "role=", target.getAttribute("role"),
+        "contenteditable=", target.getAttribute("contenteditable"));
     fillTextField(target, caption);
     // Beri sedikit waktu agar React/Lexical update state
-    await sleep(80);
+    await sleep(120);
   }
 
   /** Klik tombol dropdown "Terbitkan s..." pada row */
@@ -839,34 +935,55 @@
     }, { timeout: 5000, label: "field tanggal/waktu" });
   }
 
-  /** Set tanggal & waktu di popover */
+  /** Set tanggal & waktu di popover.
+   *  Meta layout (May 2026): 1 date input (placeholder "dd/mm/yyyy") + 2 spinbutton
+   *  inputs terpisah (aria-label "jam" + "menit"). */
   async function setScheduleDateTime(popover, dateObj) {
     const inputs = Array.from(popover.querySelectorAll("input"));
     log("schedule inputs found:", inputs.length, inputs.map((i) => ({
       type: i.type,
+      role: i.getAttribute("role"),
       placeholder: i.placeholder,
       aria: i.getAttribute("aria-label"),
       value: i.value,
+      ariaNow: i.getAttribute("aria-valuenow"),
     })));
     if (inputs.length < 2) throw new Error("Field tanggal/waktu tidak lengkap");
 
-    // Identifikasi: input pertama = tanggal, kedua = waktu (berdasarkan ordering & placeholder/aria)
-    let dateInput = null, timeInput = null;
+    let dateInput = null, jamInput = null, menitInput = null;
     for (const inp of inputs) {
-      const v = (inp.value || "") + " " + (inp.getAttribute("aria-label") || "") + " " + (inp.placeholder || "");
-      const low = v.toLowerCase();
-      if (!dateInput && (/\b\d{1,2}[\/\s\-]\d{1,2}|\b(?:jan|feb|mar|apr|mei|jun|jul|agu|sep|okt|nov|des)/.test(low) || low.includes("tanggal") || low.includes("date"))) {
+      const aria = (inp.getAttribute("aria-label") || "").toLowerCase();
+      const placeholder = (inp.placeholder || "").toLowerCase();
+      const role = (inp.getAttribute("role") || "").toLowerCase();
+      // Date input: placeholder "dd/mm/yyyy" atau pola tanggal
+      if (!dateInput && (placeholder.includes("dd") || placeholder.includes("mm") || placeholder.includes("yyyy") ||
+          aria.includes("tanggal") || aria.includes("date"))) {
         dateInput = inp;
-      } else if (!timeInput && (/\d{1,2}:\d{2}/.test(low) || low.includes("waktu") || low.includes("time"))) {
-        timeInput = inp;
+        continue;
+      }
+      // Jam (hour) spinbutton
+      if (!jamInput && (aria === "jam" || aria.includes("hour") || aria === "h")) {
+        jamInput = inp;
+        continue;
+      }
+      // Menit (minute) spinbutton
+      if (!menitInput && (aria === "menit" || aria.includes("minute") || aria === "min" || aria === "m")) {
+        menitInput = inp;
+        continue;
       }
     }
+    // Fallback heuristic kalau aria-label berbeda
     if (!dateInput) dateInput = inputs[0];
-    if (!timeInput) timeInput = inputs[inputs.length - 1];
-    if (dateInput === timeInput && inputs.length >= 2) timeInput = inputs[1];
+    const spinbuttons = inputs.filter((i) => i.getAttribute("role") === "spinbutton" && i !== dateInput);
+    if (!jamInput && spinbuttons[0]) jamInput = spinbuttons[0];
+    if (!menitInput && spinbuttons[1]) menitInput = spinbuttons[1];
+    // Last resort: kalau hanya 2 input (date + 1 time gabungan)
+    const has2Spinbuttons = !!(jamInput && menitInput);
 
-    log("schedule picked: date=", { val: dateInput.value, aria: dateInput.getAttribute("aria-label") },
-        "time=", { val: timeInput.value, aria: timeInput.getAttribute("aria-label") });
+    log("schedule picked:",
+        "date=", dateInput && { val: dateInput.value, aria: dateInput.getAttribute("aria-label"), placeholder: dateInput.placeholder },
+        "jam=", jamInput && { val: jamInput.value, aria: jamInput.getAttribute("aria-label"), role: jamInput.getAttribute("role") },
+        "menit=", menitInput && { val: menitInput.value, aria: menitInput.getAttribute("aria-label"), role: menitInput.getAttribute("role") });
 
     const dd = dateObj.getDate();
     const mm = dateObj.getMonth();
@@ -874,7 +991,8 @@
     const HH = String(dateObj.getHours()).padStart(2, "0");
     const MM = String(dateObj.getMinutes()).padStart(2, "0");
 
-    // Format kandidat untuk tanggal
+    // --- DATE ---
+    // Format kandidat untuk tanggal. dd/mm/yyyy paling kompatibel sesuai placeholder Meta.
     const dateCandidates = [
       `${String(dd).padStart(2, "0")}/${String(mm + 1).padStart(2, "0")}/${yyyy}`,
       `${dd}/${mm + 1}/${yyyy}`,
@@ -887,7 +1005,7 @@
     for (const val of dateCandidates) {
       try {
         fillTextField(dateInput, val);
-        await sleep(180);
+        await sleep(220);
         const got = (dateInput.value || "").trim();
         log(`try date "${val}" -> input.value="${got}"`);
         if (got !== "") {
@@ -898,25 +1016,45 @@
         log(`set date "${val}" error:`, String(e));
       }
     }
-    if (!dateOk) {
-      log("WARN: semua format tanggal gagal di-set");
-    }
+    if (!dateOk) log("WARN: semua format tanggal gagal di-set");
 
-    // Set waktu
-    const timeVal = `${HH}:${MM}`;
-    fillTextField(timeInput, timeVal);
-    await sleep(180);
-    log(`set time "${timeVal}" -> input.value="${timeInput.value || ""}"`);
-
-    // Blur agar form mendaftarkan perubahan
+    // Commit date (Enter + blur)
     try {
-      dateInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
-      timeInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
-      // Beberapa picker butuh Enter untuk commit
       dateInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-      timeInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+      dateInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
+      dateInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
     } catch {}
-    await sleep(200);
+    await sleep(120);
+
+    // --- TIME ---
+    if (has2Spinbuttons) {
+      // Set jam (hour) sebagai integer (Meta menerima 1-2 digit)
+      const hourVal = String(dateObj.getHours());
+      const minVal = String(dateObj.getMinutes());
+      setSpinbutton(jamInput, hourVal);
+      await sleep(140);
+      log(`set jam "${hourVal}" -> input.value="${jamInput.value || ""}" ariaNow="${jamInput.getAttribute("aria-valuenow")}"`);
+      setSpinbutton(menitInput, minVal);
+      await sleep(140);
+      log(`set menit "${minVal}" -> input.value="${menitInput.value || ""}" ariaNow="${menitInput.getAttribute("aria-valuenow")}"`);
+
+      // Commit dengan blur
+      try {
+        jamInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+        menitInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
+      } catch {}
+    } else {
+      // Legacy: 1 input time "HH:MM"
+      const fallbackTimeInput = jamInput || inputs[inputs.length - 1];
+      if (fallbackTimeInput && fallbackTimeInput !== dateInput) {
+        const timeVal = `${HH}:${MM}`;
+        fillTextField(fallbackTimeInput, timeVal);
+        await sleep(180);
+        log(`set time fallback "${timeVal}" -> input.value="${fallbackTimeInput.value || ""}"`);
+        try { fallbackTimeInput.dispatchEvent(new FocusEvent("blur", { bubbles: true })); } catch {}
+      }
+    }
+    await sleep(220);
   }
 
   /** Klik tombol "Perbarui" di popover */
@@ -1235,9 +1373,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.11.0",
+      version: "1.12.0",
     };
   };
 
-  log("content script loaded v1.11.0 on", location.href);
+  log("content script loaded v1.12.0 on", location.href);
 })();
