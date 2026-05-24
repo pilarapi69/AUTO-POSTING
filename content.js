@@ -132,21 +132,23 @@
     try { el.value = value; return true; } catch { return false; }
   }
 
-  /** Fill via paste event simulation. Lexical/contenteditable + plain textarea
-   *  keduanya respect paste event. Ini cara paling reliable untuk update state
-   *  React/Lexical karena event-nya identik dgn user paste sungguhan. */
-  function pasteIntoElement(el, text) {
+  /** Dispatch beforeinput dengan inputType=insertText. Cara native untuk
+   *  Lexical/React contenteditable menerima text input. TIDAK pakai
+   *  ClipboardEvent karena di Meta itu memicu error 'getIn' di internal
+   *  Lexical/Immutable state. */
+  function dispatchBeforeInputText(el, text, inputType = "insertText") {
+    try { el.focus(); } catch {}
     try {
-      el.focus();
-    } catch {}
-    const dt = new DataTransfer();
-    dt.setData("text/plain", text);
-    const evt = new ClipboardEvent("paste", {
-      clipboardData: dt,
-      bubbles: true,
-      cancelable: true,
-    });
-    return el.dispatchEvent(evt);
+      const evt = new InputEvent("beforeinput", {
+        inputType,
+        data: text,
+        bubbles: true,
+        cancelable: true,
+      });
+      return el.dispatchEvent(evt);
+    } catch {
+      return false;
+    }
   }
 
   /** Hapus seluruh isi input/textarea/contenteditable, dgn event yang React-aware. */
@@ -185,7 +187,11 @@
   }
 
   /** Fill teks ke input/textarea/contenteditable dengan event React-compatible.
-   *  Strategy: clear \u2192 paste event (Lexical-friendly) \u2192 verify \u2192 fallback chain. */
+   *  Strategy:
+   *   - contenteditable (Lexical): dispatch beforeinput(insertText). Lexical
+   *     onBeforeInput menerima ini dgn aman dan update internal model.
+   *   - textarea/input: native setter + InputEvent(input) - React onChange
+   *     terpicu via fiber tracker. */
   function fillTextField(el, text) {
     if (!el) return false;
     try { el.focus(); } catch {}
@@ -193,21 +199,16 @@
     const isText = el.tagName === "TEXTAREA" || el.tagName === "INPUT";
     const readVal = () => isText ? (el.value || "") : (el.textContent || "");
 
-    // Step 1: Clear existing content (jika ada)
+    // Step 1: Clear existing content
     clearTextField(el);
 
-    // Step 2: Try paste simulation (paling akurat utk Lexical+React)
-    pasteIntoElement(el, text);
-
-    if (readVal().includes(text)) return true;
-
-    // Step 3: beforeinput + native setter + input event (React-friendly)
-    try {
-      el.dispatchEvent(new InputEvent("beforeinput", {
-        inputType: "insertText", data: text, bubbles: true, cancelable: true,
-      }));
-    } catch {}
     if (isText) {
+      // beforeinput \u2192 setter \u2192 input event
+      try {
+        el.dispatchEvent(new InputEvent("beforeinput", {
+          inputType: "insertText", data: text, bubbles: true, cancelable: true,
+        }));
+      } catch {}
       setNativeProtoValue(el, text);
       try {
         el.dispatchEvent(new InputEvent("input", {
@@ -218,10 +219,15 @@
       }
       try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
     } else {
-      // contenteditable
-      try {
-        document.execCommand("insertText", false, text);
-      } catch {}
+      // contenteditable (Lexical-like): dispatch beforeinput insertText.
+      // Lexical akan handle insertion ke internal model + render.
+      dispatchBeforeInputText(el, text, "insertText");
+      // Beri sedikit waktu lalu verifikasi
+      // (Verifikasi async tidak bisa di sync function; trust Lexical to insert)
+      // Last resort kalau Lexical tidak insert: pakai execCommand
+      if (!el.textContent || !el.textContent.includes(text)) {
+        try { document.execCommand("insertText", false, text); } catch {}
+      }
       try {
         el.dispatchEvent(new InputEvent("input", {
           inputType: "insertText", data: text, bubbles: true,
@@ -229,7 +235,7 @@
       } catch {}
     }
 
-    return true;
+    return readVal().includes(text);
   }
 
   /** Set value ke spinbutton (role=spinbutton, biasanya untuk jam/menit Meta).
@@ -919,27 +925,57 @@
     return popover;
   }
 
+  /** Cari semua input field jadwal di seluruh dokumen (date, jam, menit).
+   *  Filter by visibility + placeholder/aria pattern. Tidak rely pada
+   *  reference popover yang bisa stale setelah Meta re-render. */
+  function findScheduleInputsInDocument() {
+    const all = Array.from(document.querySelectorAll("input"));
+    return all.filter((i) => {
+      const rect = i.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      const ph = (i.placeholder || "").toLowerCase();
+      const aria = (i.getAttribute("aria-label") || "").toLowerCase();
+      const role = (i.getAttribute("role") || "").toLowerCase();
+      return (
+        ph.includes("dd") || ph.includes("mm") || ph.includes("yyyy") ||
+        aria === "jam" || aria.includes("hour") || aria === "h" ||
+        aria === "menit" || aria.includes("minute") || aria === "min" || aria === "m" ||
+        aria.includes("tanggal") || aria.includes("date") ||
+        role === "spinbutton"
+      );
+    });
+  }
+
   /** Pilih tab "Jadwalkan" di popover */
   async function selectScheduleTab(popover) {
     let tabs = findAllByText("Jadwalkan", { root: popover, exact: true });
     if (!tabs.length) tabs = findAllByText("Jadwalkan", { root: popover });
+    if (!tabs.length) {
+      // popover ref bisa stale; coba dari seluruh dokumen
+      tabs = findAllByText("Jadwalkan", { exact: true });
+      if (!tabs.length) tabs = findAllByText("Jadwalkan");
+    }
     if (!tabs.length) throw new Error("Tab Jadwalkan tidak ditemukan di popover");
     // Pilih kandidat terdalam (paling kecil) yang clickable
     tabs.sort((a, b) => depth(b) - depth(a));
     const clickable = climbToClickable(tabs[0]);
     await ultraClick(clickable);
-    // Tunggu field tanggal muncul
+    // Tunggu field tanggal muncul: query dari document, bukan dari popover
+    // (popover bisa di-remount oleh Meta saat tab switch).
     await waitFor(() => {
-      const inputs = popover.querySelectorAll("input");
-      return inputs.length >= 2;
-    }, { timeout: 5000, label: "field tanggal/waktu" });
+      const sched = findScheduleInputsInDocument();
+      return sched.length >= 2;
+    }, { timeout: 8000, label: "field tanggal/waktu" });
   }
 
   /** Set tanggal & waktu di popover.
    *  Meta layout (May 2026): 1 date input (placeholder "dd/mm/yyyy") + 2 spinbutton
-   *  inputs terpisah (aria-label "jam" + "menit"). */
+   *  inputs terpisah (aria-label "jam" + "menit"). Query dari document agar
+   *  tidak terkena stale popover reference. */
   async function setScheduleDateTime(popover, dateObj) {
-    const inputs = Array.from(popover.querySelectorAll("input"));
+    // Coba dari popover dulu, jika kosong fallback ke document-wide search
+    let inputs = Array.from(popover.querySelectorAll("input"));
+    if (inputs.length < 2) inputs = findScheduleInputsInDocument();
     log("schedule inputs found:", inputs.length, inputs.map((i) => ({
       type: i.type,
       role: i.getAttribute("role"),
@@ -1373,9 +1409,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.12.0",
+      version: "1.13.0",
     };
   };
 
-  log("content script loaded v1.12.0 on", location.href);
+  log("content script loaded v1.13.0 on", location.href);
 })();
