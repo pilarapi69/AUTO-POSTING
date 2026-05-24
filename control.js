@@ -113,6 +113,16 @@ function setProgress(done, total, label) {
 // ---------- Tab discovery ----------
 async function loadTabs() {
   ui.tabSelect.innerHTML = "<option value=''>— Memuat —</option>";
+
+  // Iframe panel: prefer host tab (the Meta tab tempat panel di-inject).
+  let hostTab = null;
+  try {
+    const hostResp = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "GET_HOST_TAB" }, resolve);
+    });
+    if (hostResp?.ok) hostTab = hostResp.tab;
+  } catch {}
+
   const resp = await new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: "FIND_BUSINESS_TAB" }, resolve);
   });
@@ -132,12 +142,18 @@ async function loadTabs() {
     const opt = document.createElement("option");
     opt.value = String(t.id);
     const title = t.title ? t.title.slice(0, 70) : "(tanpa judul)";
-    opt.textContent = `${title}`;
+    const isHost = hostTab && t.id === hostTab.id;
+    opt.textContent = isHost ? `\u2605 ${title}` : title;
     opt.dataset.url = t.url || "";
     ui.tabSelect.appendChild(opt);
   }
-  // Default: tab paling cocok
-  const preferred = resp?.tab ?? tabs[0];
+  // Default: host tab (panel sedang berjalan di tab ini), fallback tab paling cocok
+  let preferred;
+  if (hostTab && tabs.some((t) => t.id === hostTab.id)) {
+    preferred = tabs.find((t) => t.id === hostTab.id);
+  } else {
+    preferred = resp?.tab ?? tabs[0];
+  }
   ui.tabSelect.value = String(preferred.id);
   state.selectedTab = preferred;
   refreshStartEnabled();

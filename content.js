@@ -963,12 +963,125 @@
     return map[m[1]] || "application/octet-stream";
   }
 
+  // ---------- Floating panel overlay (iframe) ----------
+  const PANEL_ID = "__autoPostingPanel";
+
+  function togglePanel() {
+    const existing = document.getElementById(PANEL_ID);
+    if (existing) {
+      const visible = existing.style.display !== "none";
+      existing.style.display = visible ? "none" : "block";
+      return;
+    }
+    createPanel();
+  }
+
+  function createPanel() {
+    const wrap = document.createElement("div");
+    wrap.id = PANEL_ID;
+    wrap.style.cssText = [
+      "position:fixed",
+      "top:80px",
+      "right:24px",
+      "width:420px",
+      "height:min(720px, calc(100vh - 100px))",
+      "z-index:2147483647",
+      "background:#fff",
+      "border:1px solid rgba(15,23,42,0.12)",
+      "border-radius:14px",
+      "box-shadow:0 18px 48px rgba(15,23,42,0.22), 0 2px 6px rgba(15,23,42,0.08)",
+      "overflow:hidden",
+      "display:flex",
+      "flex-direction:column",
+      "font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif",
+    ].join(";");
+
+    const bar = document.createElement("div");
+    bar.style.cssText = [
+      "display:flex",
+      "align-items:center",
+      "gap:8px",
+      "padding:8px 10px",
+      "background:linear-gradient(135deg,#4f46e5,#7c3aed)",
+      "color:#fff",
+      "cursor:move",
+      "user-select:none",
+      "flex-shrink:0",
+    ].join(";");
+    bar.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;flex:1">
+        <div style="width:22px;height:22px;border-radius:6px;background:rgba(255,255,255,0.18);display:grid;place-items:center">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
+        </div>
+        <span style="font-weight:600;font-size:12.5px;letter-spacing:-0.01em">Auto Posting</span>
+      </div>
+      <button data-act="min" title="Minimize" style="background:transparent;border:none;color:#fff;cursor:pointer;padding:4px 6px;border-radius:6px;font-size:14px;line-height:1">\u2013</button>
+      <button data-act="close" title="Tutup" style="background:transparent;border:none;color:#fff;cursor:pointer;padding:4px 6px;border-radius:6px;font-size:14px;line-height:1">\u2715</button>
+    `;
+    wrap.appendChild(bar);
+
+    const iframe = document.createElement("iframe");
+    iframe.src = chrome.runtime.getURL("control.html");
+    iframe.style.cssText = "border:0;width:100%;flex:1;background:#f6f8fb;display:block";
+    iframe.setAttribute("allow", "clipboard-read; clipboard-write");
+    wrap.appendChild(iframe);
+
+    document.body.appendChild(wrap);
+
+    // Buttons
+    bar.querySelector('[data-act="min"]').addEventListener("click", (e) => {
+      e.stopPropagation();
+      const minimized = iframe.style.display === "none";
+      iframe.style.display = minimized ? "block" : "none";
+      wrap.style.height = minimized ? "min(720px, calc(100vh - 100px))" : "auto";
+    });
+    bar.querySelector('[data-act="close"]').addEventListener("click", (e) => {
+      e.stopPropagation();
+      wrap.remove();
+    });
+
+    // Drag
+    let dragging = false;
+    let startX = 0, startY = 0, startLeft = 0, startTop = 0;
+    bar.addEventListener("mousedown", (e) => {
+      if (e.target.closest("button")) return;
+      dragging = true;
+      const rect = wrap.getBoundingClientRect();
+      startX = e.clientX;
+      startY = e.clientY;
+      startLeft = rect.left;
+      startTop = rect.top;
+      wrap.style.right = "auto";
+      wrap.style.left = startLeft + "px";
+      wrap.style.top = startTop + "px";
+      document.body.style.userSelect = "none";
+    });
+    document.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const dx = e.clientX - startX;
+      const dy = e.clientY - startY;
+      wrap.style.left = Math.max(0, Math.min(window.innerWidth - 80, startLeft + dx)) + "px";
+      wrap.style.top = Math.max(0, Math.min(window.innerHeight - 40, startTop + dy)) + "px";
+    });
+    document.addEventListener("mouseup", () => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.style.userSelect = "";
+    });
+  }
+
   // ---------- Message handler ----------
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || !msg.type) return;
 
     if (msg.type === "PING") {
       sendResponse({ ok: true, where: "content" });
+      return;
+    }
+
+    if (msg.type === "TOGGLE_PANEL") {
+      togglePanel();
+      sendResponse({ ok: true });
       return;
     }
 
@@ -1017,9 +1130,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.5.0",
+      version: "1.6.0",
     };
   };
 
-  log("content script loaded v1.5.0 on", location.href);
+  log("content script loaded v1.6.0 on", location.href);
 })();

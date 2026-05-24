@@ -1,22 +1,44 @@
 // background.js — service worker
-// Panel kontrol menyatu sebagai Chrome Side Panel (terbuka di samping browser).
-// Background relay pesan dari side panel ke content script + jalankan eksekusi MAIN-world.
+// Panel kontrol di-inject sebagai floating iframe di halaman Meta Business Suite
+// (truly "menyatu di dalam browser" — tidak ada window/side panel terpisah).
+// Background: handle klik icon \u2192 toggle panel di active tab, relay pesan main-world.
 
-// Aktifkan: klik icon extension membuka side panel
-chrome.sidePanel
-  .setPanelBehavior({ openPanelOnActionClick: true })
-  .catch((err) => console.error("setPanelBehavior failed:", err));
+async function ensureContentScript(tabId) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  } catch (e) {
+    // sudah ter-load atau halaman tidak match; lanjut
+  }
+}
 
-// Pastikan side panel tersedia di semua tab
-chrome.runtime.onInstalled.addListener(() => {
-  chrome.sidePanel
-    .setOptions({ path: "control.html", enabled: true })
-    .catch((err) => console.error("setOptions failed:", err));
+async function togglePanelOnTab(tab) {
+  if (!tab) return;
+  const url = tab.url || "";
+  const isMeta = /https:\/\/([a-z0-9-]+\.)*facebook\.com\//i.test(url);
+  if (!isMeta) {
+    // Buka tab Meta Business Suite jika belum ada
+    await chrome.tabs.create({
+      url: "https://business.facebook.com/latest/posts/scheduled_posts?asset_id=&task=POST_MANAGEMENT",
+      active: true,
+    });
+    return;
+  }
+  await ensureContentScript(tab.id);
+  try {
+    await chrome.tabs.sendMessage(tab.id, { type: "TOGGLE_PANEL" });
+  } catch (e) {
+    console.error("TOGGLE_PANEL failed:", e);
+  }
+}
+
+chrome.action.onClicked.addListener((tab) => {
+  togglePanelOnTab(tab).catch((err) => console.error(err));
 });
 
-// Relay pesan. Control panel mengirim langsung ke tab via chrome.tabs.sendMessage,
-// background menangani: FIND_BUSINESS_TAB, PING_CONTENT, CLICK_IN_MAIN_WORLD,
-// SET_FILES_IN_MAIN_WORLD, DROP_FILES_IN_MAIN_WORLD, UPLOAD_VIA_BUTTON_CLICK.
+// Relay pesan. Iframe panel mengirim ke background via chrome.runtime.sendMessage;
+// background menangani: FIND_BUSINESS_TAB, PING_CONTENT, GET_HOST_TAB,
+// CLICK_IN_MAIN_WORLD, SET_FILES_IN_MAIN_WORLD, DROP_FILES_IN_MAIN_WORLD,
+// UPLOAD_VIA_BUTTON_CLICK.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
 
@@ -38,6 +60,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       })
       .catch((err) => sendResponse({ ok: false, error: String(err) }));
     return true; // async
+  }
+
+  if (msg.type === "GET_HOST_TAB") {
+    // Dipanggil dari iframe panel — return tab tempat iframe hidup.
+    const tab = sender.tab;
+    if (!tab) {
+      sendResponse({ ok: false, error: "no host tab" });
+      return;
+    }
+    sendResponse({ ok: true, tab: { id: tab.id, url: tab.url, title: tab.title } });
+    return;
   }
 
   if (msg.type === "PING_CONTENT") {
