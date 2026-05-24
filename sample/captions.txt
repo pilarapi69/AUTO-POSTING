@@ -1,0 +1,7 @@
+Postingan pertama. Halo dunia dari Auto Posting!
+Ini contoh caption dengan beberapa baris.
+---
+Postingan kedua. Cukup teks pendek.
+---
+Postingan ketiga.
+Bisa juga panjang seperti ini, dengan emoji dan tagar #autoposting.
