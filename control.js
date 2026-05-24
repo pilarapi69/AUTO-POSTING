@@ -17,6 +17,11 @@ const ui = {
   scheduleInterval: /** @type {HTMLInputElement} */ (document.getElementById("schedule-interval")),
   scheduleSkipExisting: /** @type {HTMLInputElement} */ (document.getElementById("schedule-skip-existing")),
 
+  warnCard: document.getElementById("step-warn"),
+  warnSummary: document.getElementById("warn-summary"),
+  warnList: document.getElementById("warn-list"),
+  autoCompress: /** @type {HTMLInputElement} */ (document.getElementById("auto-compress")),
+
   previewList: document.getElementById("preview-list"),
 
   btnStart: /** @type {HTMLButtonElement} */ (document.getElementById("btn-start")),
@@ -43,6 +48,27 @@ const MEDIA_EXTS = new Set([
   ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".heif", ".tiff",
   ".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".3gp",
 ]);
+
+const IMAGE_EXTS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff"]);
+const VIDEO_EXTS = new Set([".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi", ".3gp"]);
+
+// Limit Meta untuk foto: 10 MB. Pakai safety margin ~9.5 MB.
+const META_PHOTO_LIMIT = 10 * 1024 * 1024;
+const SAFE_TARGET = 9.5 * 1024 * 1024;
+const MAX_DIMENSION = 2048;
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return (bytes / (1024 * 1024)).toFixed(2) + " MB";
+}
+
+function isImage(file) {
+  return IMAGE_EXTS.has(ext(file.name));
+}
+function isVideo(file) {
+  return VIDEO_EXTS.has(ext(file.name));
+}
 
 function ext(name) {
   const i = name.lastIndexOf(".");
@@ -185,9 +211,151 @@ ui.mediaInput.addEventListener("change", () => {
     ui.mediaSummary.textContent = `${posts.length} postingan · ${totalFiles} media`;
     ui.mediaSummary.classList.remove("error");
   }
+  renderWarnings();
   renderPreview();
   refreshStartEnabled();
 });
+
+ui.autoCompress.addEventListener("change", renderWarnings);
+
+/** Render warning card untuk file > 10MB. */
+function renderWarnings() {
+  const oversized = [];
+  const oversizedVideos = [];
+  for (const post of state.postsMedia) {
+    for (const f of post.files) {
+      if (f.size > META_PHOTO_LIMIT) {
+        if (isVideo(f)) oversizedVideos.push(f);
+        else oversized.push(f);
+      }
+    }
+  }
+  if (oversized.length + oversizedVideos.length === 0) {
+    ui.warnCard.classList.add("hidden");
+    return;
+  }
+  ui.warnCard.classList.remove("hidden");
+  const compressEnabled = ui.autoCompress.checked;
+  const imgCount = oversized.length;
+  const vidCount = oversizedVideos.length;
+  const parts = [];
+  if (imgCount) {
+    parts.push(
+      compressEnabled
+        ? `${imgCount} foto > 10MB akan di-compress otomatis ke JPEG saat upload.`
+        : `${imgCount} foto > 10MB — Meta akan tolak (centang auto-compress).`
+    );
+  }
+  if (vidCount) {
+    parts.push(`${vidCount} video > 10MB — compress manual dulu (extension tidak compress video).`);
+  }
+  ui.warnSummary.textContent = parts.join(" ");
+
+  ui.warnList.innerHTML = "";
+  const all = [...oversized, ...oversizedVideos].slice(0, 30);
+  for (const f of all) {
+    const li = document.createElement("li");
+    const isImg = isImage(f);
+    if (isImg && compressEnabled) li.classList.add("ok");
+    const sizeLabel = formatSize(f.size) + (isImg && compressEnabled ? " → ~9.5MB" : " ✖");
+    li.innerHTML = `<span class="name">${escapeHtml(f.name)}</span><span class="size">${escapeHtml(sizeLabel)}</span>`;
+    ui.warnList.appendChild(li);
+  }
+  if (oversized.length + oversizedVideos.length > 30) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="name muted">… dan ${oversized.length + oversizedVideos.length - 30} file lain</span>`;
+    ui.warnList.appendChild(li);
+  }
+}
+
+/** Compress image file via Canvas → JPEG, iterative quality/scale reduction. */
+async function compressImage(file, opts = {}) {
+  const target = opts.target || SAFE_TARGET;
+  const maxDim = opts.maxDim || MAX_DIMENSION;
+
+  // Load image (handle HEIC etc. via createImageBitmap fallback)
+  let bitmap;
+  try {
+    bitmap = await createImageBitmap(file);
+  } catch (e) {
+    // Fallback: HTMLImageElement via blob URL
+    const url = URL.createObjectURL(file);
+    try {
+      bitmap = await new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = (ev) => reject(new Error("Image load failed: " + (ev?.message || "")));
+        img.src = url;
+      });
+    } finally {
+      URL.revokeObjectURL(url);
+    }
+  }
+
+  const origW = bitmap.width || bitmap.naturalWidth;
+  const origH = bitmap.height || bitmap.naturalHeight;
+  if (!origW || !origH) throw new Error("Tidak bisa baca dimensi gambar");
+
+  // Iterative: turunkan scale & quality sampai size cukup
+  let scale = 1;
+  // Start dari max dimension
+  const maxOf = Math.max(origW, origH);
+  if (maxOf > maxDim) scale = maxDim / maxOf;
+
+  let quality = 0.88;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const w = Math.max(1, Math.round(origW * scale));
+    const h = Math.max(1, Math.round(origH * scale));
+    const canvas = (typeof OffscreenCanvas !== "undefined")
+      ? new OffscreenCanvas(w, h)
+      : Object.assign(document.createElement("canvas"), { width: w, height: h });
+    const ctx = canvas.getContext("2d");
+    if (!ctx) throw new Error("Canvas 2D context tidak tersedia");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, w, h);
+    ctx.drawImage(bitmap, 0, 0, w, h);
+
+    let blob;
+    if (canvas.convertToBlob) {
+      blob = await canvas.convertToBlob({ type: "image/jpeg", quality });
+    } else {
+      blob = await new Promise((resolve, reject) => {
+        canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("toBlob null"))), "image/jpeg", quality);
+      });
+    }
+    if (blob.size <= target) {
+      // Convert blob → File dengan nama .jpg
+      const newName = file.name.replace(/\.[^.]+$/, "") + ".jpg";
+      return new File([blob], newName, { type: "image/jpeg", lastModified: file.lastModified || Date.now() });
+    }
+    // Tidak cukup, kurangi scale & quality
+    if (quality > 0.55) quality -= 0.1;
+    else scale *= 0.85;
+  }
+  throw new Error(`Gagal compress "${file.name}" di bawah ${formatSize(target)}`);
+}
+
+/** Compress + serialize files untuk satu post sebelum kirim. */
+async function preparePostFiles(post, compress) {
+  const out = [];
+  for (const f of post.files) {
+    let final = f;
+    if (compress && isImage(f) && f.size > META_PHOTO_LIMIT) {
+      try {
+        log(`Compressing ${f.name} (${formatSize(f.size)})…`, "warn");
+        final = await compressImage(f);
+        log(`  → ${final.name} ${formatSize(final.size)}`, "ok");
+      } catch (e) {
+        log(`Compress gagal untuk ${f.name}: ${e.message}. Pakai file asli (kemungkinan Meta tolak).`, "err");
+      }
+    } else if (compress && isVideo(f) && f.size > META_PHOTO_LIMIT) {
+      log(`Video ${f.name} > 10MB — dikirim apa adanya (compress manual jika perlu).`, "warn");
+    }
+    const buf = await final.arrayBuffer();
+    out.push({ name: final.name, type: final.type, lastModified: final.lastModified || Date.now(), buffer: buf });
+  }
+  return out;
+}
 
 // ---------- File caption ----------
 ui.captionInput.addEventListener("change", async () => {
@@ -369,12 +537,8 @@ async function startAutomation() {
     log(`#${i + 1}: "${truncate(caption, 60)}" — ${post.files.length} media — jadwal: ${formatHuman(when)}`, "info");
     setProgress(i, usable, `Memproses ${i + 1}/${usable}`);
 
-    // Serialize files to ArrayBuffer for messaging
-    const filesPayload = [];
-    for (const f of post.files) {
-      const buf = await f.arrayBuffer();
-      filesPayload.push({ name: f.name, type: f.type, lastModified: f.lastModified, buffer: buf });
-    }
+    // Compress (jika perlu) + serialize files to ArrayBuffer for messaging
+    const filesPayload = await preparePostFiles(post, ui.autoCompress.checked);
 
     let response;
     try {

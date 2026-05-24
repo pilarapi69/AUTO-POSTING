@@ -1,51 +1,22 @@
 // background.js — service worker
-// Membuka panel kontrol (window terpisah) saat icon extension diklik,
-// dan merelay pesan antara panel kontrol dan content script di tab Meta Business Suite.
+// Panel kontrol menyatu sebagai Chrome Side Panel (terbuka di samping browser).
+// Background relay pesan dari side panel ke content script + jalankan eksekusi MAIN-world.
 
-const CONTROL_URL = chrome.runtime.getURL("control.html");
-const CONTROL_WIN_KEY = "autoPosting.controlWindowId";
+// Aktifkan: klik icon extension membuka side panel
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: true })
+  .catch((err) => console.error("setPanelBehavior failed:", err));
 
-// Buka / fokus ke control window
-async function openControlWindow() {
-  const stored = await chrome.storage.session.get(CONTROL_WIN_KEY);
-  const existingId = stored[CONTROL_WIN_KEY];
-
-  if (existingId) {
-    try {
-      const win = await chrome.windows.get(existingId, { populate: false });
-      if (win) {
-        await chrome.windows.update(existingId, { focused: true, state: "normal" });
-        return win;
-      }
-    } catch (e) {
-      // window sudah tertutup, lanjut buat baru
-    }
-  }
-
-  const win = await chrome.windows.create({
-    url: CONTROL_URL,
-    type: "popup",
-    width: 520,
-    height: 760,
-    focused: true,
-  });
-  await chrome.storage.session.set({ [CONTROL_WIN_KEY]: win.id });
-  return win;
-}
-
-chrome.action.onClicked.addListener(() => {
-  openControlWindow().catch((err) => console.error("Failed to open control window:", err));
+// Pastikan side panel tersedia di semua tab
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.sidePanel
+    .setOptions({ path: "control.html", enabled: true })
+    .catch((err) => console.error("setOptions failed:", err));
 });
 
-chrome.windows.onRemoved.addListener(async (windowId) => {
-  const stored = await chrome.storage.session.get(CONTROL_WIN_KEY);
-  if (stored[CONTROL_WIN_KEY] === windowId) {
-    await chrome.storage.session.remove(CONTROL_WIN_KEY);
-  }
-});
-
-// Relay pesan (opsional). Control panel mengirim langsung ke tab via chrome.tabs.sendMessage,
-// jadi background hanya menangani actions seperti "FIND_BUSINESS_TAB" dan "PING".
+// Relay pesan. Control panel mengirim langsung ke tab via chrome.tabs.sendMessage,
+// background menangani: FIND_BUSINESS_TAB, PING_CONTENT, CLICK_IN_MAIN_WORLD,
+// SET_FILES_IN_MAIN_WORLD, DROP_FILES_IN_MAIN_WORLD, UPLOAD_VIA_BUTTON_CLICK.
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || !msg.type) return;
 

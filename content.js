@@ -485,6 +485,58 @@
     return null;
   }
 
+  /** Race: tunggu media muncul di row ATAU dialog error muncul. */
+  async function waitForUploadOutcome(row, timeoutMs = 30000) {
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      if (rowHasMedia(row)) return { hasMedia: true, rejected: false };
+      const closed = await closeFileReadErrorDialog();
+      if (closed.closed) {
+        return { hasMedia: false, rejected: true, reason: closed.reason };
+      }
+      await sleep(300);
+    }
+    return { hasMedia: false, rejected: false };
+  }
+
+  /** Deteksi & tutup dialog error "Tidak Bisa Membaca File" / "Cannot read file" */
+  async function closeFileReadErrorDialog() {
+    const errorKeywords = [
+      "Tidak Bisa Membaca File",
+      "tidak bisa diunggah",
+      "tidak dapat diunggah",
+      "Cannot read file",
+      "couldn\u2019t be uploaded",
+      "couldn't be uploaded",
+      "Foto harus berukuran kurang dari",
+      "Photo must be smaller",
+    ];
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], [role="alertdialog"]'));
+    for (const d of dialogs) {
+      const r = d.getBoundingClientRect();
+      if (r.width < 50 || r.height < 50 || d.offsetParent === null) continue;
+      const txt = (d.innerText || "").toLowerCase();
+      const hit = errorKeywords.some((kw) => txt.includes(kw.toLowerCase()));
+      if (!hit) continue;
+      log("error dialog terdeteksi, mencoba tutup");
+      const closeKeywords = ["Tutup", "OK", "Oke", "Close", "Dismiss", "Batal", "Cancel"];
+      for (const kw of closeKeywords) {
+        const btns = findAllByText(kw, { root: d });
+        if (btns.length) {
+          btns.sort((a, b) => depth(b) - depth(a));
+          const target = climbToClickable(btns[0]);
+          await ultraClick(target);
+          await sleep(200);
+          return { closed: true, reason: txt.substring(0, 200) };
+        }
+      }
+      pressEscape();
+      await sleep(200);
+      return { closed: true, reason: txt.substring(0, 200), via: "escape" };
+    }
+    return { closed: false };
+  }
+
   /** Dump isi modal/halaman untuk diagnosis */
   function dumpModalState() {
     const modal = findActiveModal();
@@ -569,15 +621,21 @@
     let res = await uploadViaButtonClickMainWorld(addBtn, files, { timeout: 6000 });
     if (res.ok) {
       log(`step 1 berhasil via ${res.source}, ${res.count} file`);
-      try {
-        await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
-      } catch (e) {
-        log("warning preview media: " + e.message);
-      }
+      // Tunggu preview muncul ATAU error dialog Meta muncul (race)
+      const verdict = await waitForUploadOutcome(row, 30000);
       pressEscape();
+      if (verdict.rejected) {
+        throw new Error("Meta tolak file: " + (verdict.reason || "format/size tidak valid").substring(0, 200));
+      }
+      if (!verdict.hasMedia) {
+        log("warning preview media: tidak terlihat, lanjut");
+      }
       return;
     }
     log("step 1 gagal: " + res.error);
+
+    // Sebelum lanjut step lain, cek/tutup error dialog yang mungkin muncul
+    await closeFileReadErrorDialog();
 
     // === Step 2: cek modal, klik tombol upload di dalam modal, ulangi ===
     const modal = findActiveModal();
@@ -959,9 +1017,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.4.0",
+      version: "1.5.0",
     };
   };
 
-  log("content script loaded v1.4.0 on", location.href);
+  log("content script loaded v1.5.0 on", location.href);
 })();

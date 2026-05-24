@@ -105,6 +105,23 @@
           </div>
         </section>
 
+        <section class="card warn-card hidden" id="step-warn">
+          <div class="card-head">
+            <div class="step-num" style="background: rgba(245,158,11,0.16); color: var(--warning);">!</div>
+            <div>
+              <h2>File &gt; 10 MB</h2>
+              <p class="muted" id="warn-summary">—</p>
+            </div>
+          </div>
+          <div class="row" style="margin-bottom: 8px">
+            <label class="checkbox">
+              <input id="auto-compress" type="checkbox" checked />
+              <span>Auto-compress jadi JPEG saat upload (target &lt; 9.5MB, max 2048px)</span>
+            </label>
+          </div>
+          <ul id="warn-list" class="warn-list"></ul>
+        </section>
+
         <section class="card" id="step-preview">
           <div class="card-head">
             <div class="step-num">5</div>
