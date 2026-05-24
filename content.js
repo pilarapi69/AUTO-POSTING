@@ -117,19 +117,126 @@
     el.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: text }));
   }
 
-  /** Klik manusia: dispatch pointer/mouse events */
+  /** Klik manusia: dispatch pointer/mouse events (di isolated world) */
   function realClick(el) {
+    if (!el) return;
     const rect = el.getBoundingClientRect();
     const x = rect.left + rect.width / 2;
     const y = rect.top + rect.height / 2;
-    const opts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y, button: 0 };
-    el.dispatchEvent(new PointerEvent("pointerover", opts));
-    el.dispatchEvent(new PointerEvent("pointerenter", opts));
-    el.dispatchEvent(new PointerEvent("pointerdown", opts));
+    const opts = {
+      bubbles: true, cancelable: true, composed: true, view: window,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+      button: 0, buttons: 1, detail: 1,
+    };
+    const popts = { ...opts, pointerType: "mouse", pointerId: 1, isPrimary: true, pressure: 0.5 };
+    el.dispatchEvent(new PointerEvent("pointerover", popts));
+    el.dispatchEvent(new PointerEvent("pointerenter", popts));
+    el.dispatchEvent(new MouseEvent("mouseover", opts));
+    el.dispatchEvent(new MouseEvent("mouseenter", opts));
+    el.dispatchEvent(new PointerEvent("pointerdown", popts));
     el.dispatchEvent(new MouseEvent("mousedown", opts));
-    el.dispatchEvent(new PointerEvent("pointerup", opts));
+    el.dispatchEvent(new PointerEvent("pointerup", popts));
     el.dispatchEvent(new MouseEvent("mouseup", opts));
     el.dispatchEvent(new MouseEvent("click", opts));
+  }
+
+  // ---------- MAIN WORLD bridge (lewat background service worker) ----------
+  // Konversi ArrayBuffer → base64 (chunked agar tidak overflow stack)
+  function abToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    const CHUNK = 0x8000;
+    let str = "";
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+      str += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+    }
+    return btoa(str);
+  }
+  async function filesToSpecs(files) {
+    const out = [];
+    for (const f of files) {
+      const buf = await f.arrayBuffer();
+      out.push({
+        name: f.name,
+        type: f.type || guessType(f.name),
+        lastModified: f.lastModified || Date.now(),
+        b64: abToBase64(buf),
+      });
+    }
+    return out;
+  }
+
+  /** Trigger element.click() di MAIN world (lewat background → chrome.scripting). */
+  async function clickInMainWorld(el) {
+    if (!el) return false;
+    const tag = "__ap_click_" + Math.random().toString(36).slice(2);
+    el.setAttribute("data-ap-click", tag);
+    try {
+      const res = await chrome.runtime.sendMessage({
+        type: "CLICK_IN_MAIN_WORLD",
+        selector: '[data-ap-click="' + tag + '"]',
+      });
+      log("main-world click result:", res?.res);
+      return !!res?.ok;
+    } catch (e) {
+      log("main-world click error:", String(e));
+      return false;
+    } finally {
+      try { el.removeAttribute("data-ap-click"); } catch {}
+    }
+  }
+
+  /** Set input[type=file].files di MAIN world. */
+  async function setFilesInMainWorld(input, files) {
+    if (!input) return false;
+    const tag = "__ap_input_" + Math.random().toString(36).slice(2);
+    input.setAttribute("data-ap-input", tag);
+    try {
+      const specs = await filesToSpecs(files);
+      const res = await chrome.runtime.sendMessage({
+        type: "SET_FILES_IN_MAIN_WORLD",
+        selector: '[data-ap-input="' + tag + '"]',
+        files: specs,
+      });
+      log("main-world set-files result:", res?.res);
+      return !!(res?.ok && res?.res?.ok);
+    } catch (e) {
+      log("main-world set-files error:", String(e));
+      return false;
+    } finally {
+      try { input.removeAttribute("data-ap-input"); } catch {}
+    }
+  }
+
+  /** Dispatch trusted drop di MAIN world. */
+  async function dropFilesInMainWorld(target, files) {
+    if (!target) return false;
+    const tag = "__ap_drop_" + Math.random().toString(36).slice(2);
+    target.setAttribute("data-ap-drop", tag);
+    try {
+      const specs = await filesToSpecs(files);
+      const res = await chrome.runtime.sendMessage({
+        type: "DROP_FILES_IN_MAIN_WORLD",
+        selector: '[data-ap-drop="' + tag + '"]',
+        files: specs,
+      });
+      log("main-world drop result:", res?.res);
+      return !!(res?.ok && res?.res?.ok);
+    } catch (e) {
+      log("main-world drop error:", String(e));
+      return false;
+    } finally {
+      try { target.removeAttribute("data-ap-drop"); } catch {}
+    }
+  }
+
+  /** Klik full power: synthetic events + native .click() di main world. */
+  async function ultraClick(el) {
+    if (!el) return;
+    try { el.scrollIntoView({ block: "center" }); } catch {}
+    await sleep(60);
+    const clickable = climbToClickable(el);
+    realClick(clickable);
+    await clickInMainWorld(clickable);
   }
 
   /** Cari kontainer baris (row) postingan.
@@ -318,8 +425,8 @@
     const addBtn = findAllByText("Tambahkan foto/video", { root: row })[0];
     if (!addBtn) throw new Error("Tombol 'Tambahkan foto/video' tidak ditemukan di row");
     const clickable = climbToClickable(addBtn);
-    log("klik tombol Tambahkan foto/video");
-    realClick(clickable);
+    log("ultraClick Tambahkan foto/video");
+    await ultraClick(clickable);
     return clickable;
   }
 
@@ -332,9 +439,6 @@
       "Pilih foto",
       "Unggah foto",
       "Unggah video",
-      "Tambahkan foto/video",
-      "Tambahkan foto",
-      "Tambahkan video",
       "Upload from computer",
       "From your computer",
       "Choose from computer",
@@ -348,8 +452,8 @@
       if (els.length) {
         els.sort((a, b) => depth(b) - depth(a));
         const target = climbToClickable(els[0]);
-        log(`klik kandidat upload di modal: "${kw}"`);
-        realClick(target);
+        log(`ultraClick kandidat upload di modal: "${kw}"`);
+        await ultraClick(target);
         return kw;
       }
     }
@@ -369,15 +473,13 @@
     return { modalFound: !!modal, buttons, fileInputCount: fileInputs.length };
   }
 
-  /** Cari input[type=file] dengan watcher (click hook + mutation observer) */
+  /** Cari input[type=file] yang baru muncul setelah suatu aksi. */
   function watchForFileInput({ timeout = 8000 } = {}) {
-    return new Promise((resolve, reject) => {
+    return new Promise((resolve) => {
       let done = false;
-      const origClick = HTMLInputElement.prototype.click;
       const before = new Set(document.querySelectorAll('input[type="file"]'));
 
       const cleanup = () => {
-        try { HTMLInputElement.prototype.click = origClick; } catch {}
         try { observer.disconnect(); } catch {}
         clearTimeout(timer);
       };
@@ -389,26 +491,20 @@
         resolve(input);
       };
 
-      HTMLInputElement.prototype.click = function () {
-        if (!done && this.type === "file") {
-          finish(this, "prototype-click hook");
-          return;
-        }
-        return origClick.call(this);
-      };
+      // Poll dulu: kalau sudah ada di DOM, langsung resolve
+      const existing = document.querySelector('input[type="file"]');
+      if (existing) {
+        finish(existing, "existing-input snapshot");
+        return;
+      }
 
-      const observer = new MutationObserver((mutations) => {
-        for (const m of mutations) {
-          for (const node of m.addedNodes) {
-            if (node.nodeType !== 1) continue;
-            const el = /** @type {Element} */ (node);
-            const found =
-              (el.matches?.('input[type="file"]') ? el : null) ||
-              el.querySelector?.('input[type="file"]');
-            if (found && !before.has(found)) {
-              finish(/** @type {HTMLInputElement} */ (found), "mutation observer");
-              return;
-            }
+      const observer = new MutationObserver(() => {
+        // pendekatan lebih aman: scan ulang dokumen, ambil yang "baru"
+        const all = Array.from(document.querySelectorAll('input[type="file"]'));
+        for (const inp of all) {
+          if (!before.has(inp)) {
+            finish(inp, "mutation observer");
+            return;
           }
         }
       });
@@ -418,109 +514,105 @@
         if (!done) {
           done = true;
           cleanup();
-          // resolve null tanpa reject biar caller bisa lanjut
           resolve(null);
         }
       }, timeout);
     });
   }
 
-  /** Upload file untuk row. Strategi berlapis:
-   *   A) Drag-drop ke row (paling sering work pada composer Meta)
-   *   B) Klik "Tambahkan foto/video" + watch input.click hook + mutation observer (5s)
-   *   C) Klik tombol upload di dalam modal aktif (jika muncul) + watch (5s)
-   *   D) Cari input[type=file] global pertama dan force set
+  /** Set files via main world + dispatch change/input. Fallback ke isolated world. */
+  async function setFilesEverywhere(input, files) {
+    const ok = await setFilesInMainWorld(input, files);
+    if (!ok) {
+      log("setFilesInMainWorld gagal, fallback ke isolated world");
+      setInputFiles(input, files);
+    }
+  }
+
+  /** Upload file untuk row. Strategi (semua via MAIN world):
+   *   1) ultraClick "Tambahkan foto/video" + watch input baru ter-mount
+   *   2) Kalau muncul modal, ultraClick tombol upload di dalam modal + watch lagi
+   *   3) Set files ke input via main-world DataTransfer
+   *   4) Fallback: setFilesInMainWorld ke input[type=file] global pertama
+   *   5) Fallback terakhir: dropFilesInMainWorld ke row container
    */
   async function uploadFilesToRow(row, files) {
-    const beforeRowHasMedia = rowHasMedia(row);
+    const beforeInputCount = document.querySelectorAll('input[type="file"]').length;
 
-    // === Strategy A: Drag-drop ===
-    log("strategi A: drag-drop ke row");
-    try {
-      dispatchDropOnElement(row, files);
-      const ok = await waitFor(() => rowHasMedia(row) && !beforeRowHasMedia, {
-        timeout: 6000,
-        interval: 200,
-        label: "preview media (drag-drop)",
-      }).then(() => true).catch(() => false);
-      if (ok) {
-        log("strategi A berhasil");
-        return;
+    // === Step 1: ultraClick "Tambahkan foto/video" + watch ===
+    log("step 1: ultraClick 'Tambahkan foto/video' + watch file input");
+    const watcher1 = watchForFileInput({ timeout: 5000 });
+    await clickAddMediaButton(row);
+    let input = await watcher1;
+
+    // === Step 2: Kalau modal terbuka tapi belum ada input file, klik tombol upload ===
+    if (!input) {
+      const modal = findActiveModal();
+      if (modal) {
+        log("step 2: modal terdeteksi, mencoba klik tombol upload");
+        const watcher2 = watchForFileInput({ timeout: 7000 });
+        const clicked = await clickUploadInModal(modal);
+        if (clicked) {
+          input = await watcher2;
+        } else {
+          log("step 2: tidak menemukan kandidat tombol upload");
+        }
       }
-    } catch (e) {
-      log("strategi A error: " + e.message);
     }
 
-    // === Strategy B: Klik tombol + watch ===
-    log("strategi B: klik 'Tambahkan foto/video' + watch file input");
-    const watcherB = watchForFileInput({ timeout: 5000 });
-    try {
-      await clickAddMediaButton(row);
-    } catch (e) {
-      throw new Error(e.message);
-    }
-    const inputB = await watcherB;
-    if (inputB) {
-      setInputFiles(inputB, files);
-      log(`strategi B: ${files.length} file dikirim ke input`);
+    // === Step 3: Set files ke input yang ketemu ===
+    if (input) {
+      await setFilesEverywhere(input, files);
+      log(`${files.length} file dikirim ke input`);
       try {
         await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
+        pressEscape();
+        return;
       } catch (e) {
         log("warning preview media: " + e.message);
-      }
-      // Close any leftover modal
-      pressEscape();
-      return;
-    }
-
-    // === Strategy C: Modal sudah muncul, klik tombol upload di dalamnya ===
-    const modal = findActiveModal();
-    if (modal) {
-      log("strategi C: modal terdeteksi, mencoba klik upload di modal");
-      const watcherC = watchForFileInput({ timeout: 6000 });
-      const clicked = await clickUploadInModal(modal);
-      if (clicked) {
-        const inputC = await watcherC;
-        if (inputC) {
-          setInputFiles(inputC, files);
-          log(`strategi C: ${files.length} file dikirim ke input via "${clicked}"`);
-          try {
-            await waitFor(() => rowHasMedia(row), { timeout: 30000, label: "preview media" });
-          } catch (e) {
-            log("warning preview media: " + e.message);
-          }
-          pressEscape();
-          return;
-        }
-      } else {
-        log("strategi C: tidak menemukan tombol upload di dalam modal");
+        pressEscape();
+        return;
       }
     }
 
-    // === Strategy D: input file global pertama ===
-    const anyInput = document.querySelector('input[type="file"]');
-    if (anyInput) {
-      log("strategi D: force-set ke input[type=file] global pertama");
-      setInputFiles(anyInput, files);
+    // === Step 4: Force ke input global pertama ===
+    const allInputs = Array.from(document.querySelectorAll('input[type="file"]'));
+    if (allInputs.length > beforeInputCount) {
+      const fresh = allInputs[allInputs.length - 1];
+      log("step 4: force-set ke input[type=file] terbaru");
+      await setFilesEverywhere(fresh, files);
       try {
         await waitFor(() => rowHasMedia(row), { timeout: 15000, label: "preview media (global input)" });
         pressEscape();
         return;
       } catch (e) {
-        log("strategi D gagal: preview tidak muncul");
+        log("step 4 gagal: " + e.message);
       }
     }
 
-    // Dump diagnosis ke console untuk dilihat user
+    // === Step 5: Drag-drop trusted via main world ===
+    log("step 5: drag-drop trusted via main world");
+    const dropOk = await dropFilesInMainWorld(row, files);
+    if (dropOk) {
+      try {
+        await waitFor(() => rowHasMedia(row), { timeout: 15000, label: "preview media (drop)" });
+        pressEscape();
+        return;
+      } catch (e) {
+        log("step 5 preview tidak muncul: " + e.message);
+      }
+    }
+
+    // Diagnosis
     const diag = dumpModalState();
     log("DIAGNOSIS upload gagal:", diag);
     pressEscape();
     throw new Error(
       "Gagal upload media (semua strategi). Modal: " +
         (diag.modalFound ? "YA (" + (diag.buttons?.length || 0) + " tombol)" : "TIDAK") +
-        ", file inputs: " +
+        ", file inputs di DOM: " +
         diag.fileInputCount +
-        ". Lihat console untuk detail tombol."
+        ". Cek console untuk detail tombol modal."
     );
   }
 
@@ -567,7 +659,7 @@
       }
     }
     if (!btn) throw new Error("Tombol dropdown jadwal tidak ditemukan pada row");
-    realClick(btn);
+    await ultraClick(btn);
     // Tunggu popover muncul (ada teks "Jadwalkan" DAN "Terbitkan sekarang")
     const popover = await waitFor(() => {
       const candidates = findAllByText("Jadwalkan");
@@ -594,7 +686,7 @@
     // Pilih kandidat terdalam (paling kecil) yang clickable
     tabs.sort((a, b) => depth(b) - depth(a));
     const clickable = climbToClickable(tabs[0]);
-    realClick(clickable);
+    await ultraClick(clickable);
     // Tunggu field tanggal muncul
     await waitFor(() => {
       const inputs = popover.querySelectorAll("input");
@@ -671,7 +763,7 @@
     const candidates = findAllByText("Perbarui", { root: popover });
     if (!candidates.length) throw new Error("Tombol Perbarui tidak ditemukan");
     const btn = climbToClickable(candidates[0]);
-    realClick(btn);
+    await ultraClick(btn);
     // Tunggu popover hilang
     await waitFor(() => !document.body.contains(popover) || popover.offsetParent === null, {
       timeout: 5000, label: "popover tertutup",
@@ -683,7 +775,7 @@
     const before = getPostRows().length;
     const btn = findAddPostButton();
     if (!btn) throw new Error("Tombol 'Tambahkan postingan' tidak ditemukan");
-    realClick(btn);
+    await ultraClick(btn);
     await waitFor(() => getPostRows().length > before, {
       timeout: 5000, label: "row baru muncul",
     });
@@ -837,9 +929,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.2.0",
+      version: "1.3.0",
     };
   };
 
-  log("content script loaded v1.2.0 on", location.href);
+  log("content script loaded v1.3.0 on", location.href);
 })();
