@@ -132,23 +132,49 @@
     try { el.value = value; return true; } catch { return false; }
   }
 
-  /** Dispatch beforeinput dengan inputType=insertText. Cara native untuk
-   *  Lexical/React contenteditable menerima text input. TIDAK pakai
-   *  ClipboardEvent karena di Meta itu memicu error 'getIn' di internal
-   *  Lexical/Immutable state. */
-  function dispatchBeforeInputText(el, text, inputType = "insertText") {
+  /** Ketik karakter ke field per-character, dgn full event sequence yang
+   *  React + Lexical pasti tangkap:
+   *    keydown \u2192 beforeinput(insertText) \u2192 [exec insert] \u2192 input(insertText) \u2192 keyup
+   *  Strategi insert:
+   *    - INPUT/TEXTAREA: native setter (append char ke value)
+   *    - contenteditable (Lexical): document.execCommand("insertText", ch)
+   *      generates REAL browser input event, Lexical handler aman.
+   *  Per-char inilah yg bikin Lexical state ter-sync sungguhan (vs bulk
+   *  setValue yang Lexical anggap data-corruption \u2192 placeholder tetap render). */
+  async function typeIntoField(el, text, delay = 18) {
+    if (!el || !text) return false;
     try { el.focus(); } catch {}
-    try {
-      const evt = new InputEvent("beforeinput", {
-        inputType,
-        data: text,
-        bubbles: true,
-        cancelable: true,
-      });
-      return el.dispatchEvent(evt);
-    } catch {
-      return false;
+    const isText = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
+    for (const ch of text) {
+      try {
+        el.dispatchEvent(new KeyboardEvent("keydown", { key: ch, bubbles: true, cancelable: true }));
+      } catch {}
+      try {
+        el.dispatchEvent(new InputEvent("beforeinput", {
+          inputType: "insertText", data: ch, bubbles: true, cancelable: true,
+        }));
+      } catch {}
+      if (isText) {
+        setNativeProtoValue(el, (el.value || "") + ch);
+      } else if (el.isContentEditable) {
+        try {
+          document.execCommand("insertText", false, ch);
+        } catch {
+          try { el.innerText = (el.innerText || "") + ch; } catch {}
+        }
+      }
+      try {
+        el.dispatchEvent(new InputEvent("input", {
+          inputType: "insertText", data: ch, bubbles: true,
+        }));
+      } catch {}
+      try {
+        el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true, cancelable: true }));
+      } catch {}
+      if (delay > 0) await sleep(delay);
     }
+    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+    return true;
   }
 
   /** Hapus seluruh isi input/textarea/contenteditable, dgn event yang React-aware. */
@@ -186,77 +212,101 @@
     }
   }
 
-  /** Fill teks ke input/textarea/contenteditable dengan event React-compatible.
-   *  Strategy:
-   *   - contenteditable (Lexical): dispatch beforeinput(insertText). Lexical
-   *     onBeforeInput menerima ini dgn aman dan update internal model.
-   *   - textarea/input: native setter + InputEvent(input) - React onChange
-   *     terpicu via fiber tracker. */
+  /** Set value ke INPUT/TEXTAREA dgn React-tracker satu-shot.
+   *  Untuk picker tanggal Meta: gunakan ini, jangan typeIntoField (datepicker
+   *  bisa reject value parsial saat di-type karakter-per-karakter). */
+  async function setInputValueOneShot(input, value) {
+    if (!input) return false;
+    try { input.focus(); } catch {}
+    try { input.select(); } catch {}
+    setNativeProtoValue(input, value);
+    try { input.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
+    try { input.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
+    await sleep(40);
+    return true;
+  }
+
+  /** Compat shim: fillTextField sync, dipakai code lama. Untuk path yg masuk
+   *  ke contenteditable hasilnya bisa tidak update Lexical state \u2014 gunakan
+   *  typeIntoField (async) sebagai gantinya bila memungkinkan. */
   function fillTextField(el, text) {
     if (!el) return false;
     try { el.focus(); } catch {}
-
     const isText = el.tagName === "TEXTAREA" || el.tagName === "INPUT";
-    const readVal = () => isText ? (el.value || "") : (el.textContent || "");
-
-    // Step 1: Clear existing content
     clearTextField(el);
-
     if (isText) {
-      // beforeinput \u2192 setter \u2192 input event
-      try {
-        el.dispatchEvent(new InputEvent("beforeinput", {
-          inputType: "insertText", data: text, bubbles: true, cancelable: true,
-        }));
-      } catch {}
       setNativeProtoValue(el, text);
-      try {
-        el.dispatchEvent(new InputEvent("input", {
-          inputType: "insertText", data: text, bubbles: true,
-        }));
-      } catch {
-        el.dispatchEvent(new Event("input", { bubbles: true }));
-      }
+      try { el.dispatchEvent(new Event("input", { bubbles: true })); } catch {}
       try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
     } else {
-      // contenteditable (Lexical-like): dispatch beforeinput insertText.
-      // Lexical akan handle insertion ke internal model + render.
-      dispatchBeforeInputText(el, text, "insertText");
-      // Beri sedikit waktu lalu verifikasi
-      // (Verifikasi async tidak bisa di sync function; trust Lexical to insert)
-      // Last resort kalau Lexical tidak insert: pakai execCommand
-      if (!el.textContent || !el.textContent.includes(text)) {
-        try { document.execCommand("insertText", false, text); } catch {}
-      }
-      try {
-        el.dispatchEvent(new InputEvent("input", {
-          inputType: "insertText", data: text, bubbles: true,
-        }));
-      } catch {}
+      try { document.execCommand("insertText", false, text); } catch {}
     }
-
-    return readVal().includes(text);
+    return true;
   }
 
-  /** Set value ke spinbutton (role=spinbutton, biasanya untuk jam/menit Meta).
-   *  Strategy: native setter + InputEvent. Jika tidak nyangkut, pakai keyboard
-   *  arrow simulation utk increment/decrement dari nilai current ke target. */
-  function setSpinbutton(el, targetValue) {
+  /** Set value ke spinbutton (role=spinbutton: jam/menit Meta).
+   *  ARIA spinbutton menyimpan state di aria-valuenow (BUKAN input.value yg
+   *  biasanya kosong). React tracker tidak ada di sini, hanya event listener
+   *  keyboard. Strategy:
+   *    1) Ketik digit target sebagai keystrokes (keydown+keypress+keyup).
+   *       Spinbutton menerima 2 keystroke "0"+"9" \u2192 set ke 9.
+   *    2) Kalau typing tidak nyangkut, pakai ArrowUp/ArrowDown along shortest
+   *       circular path (mis: jam 9 \u2192 16, step ArrowUp 7x). */
+  async function setSpinbutton(el, targetValue) {
     if (!el) return false;
+    const targetNum = parseInt(String(targetValue), 10);
+    if (!Number.isFinite(targetNum)) return false;
+    const min = Number(el.getAttribute("aria-valuemin") || 0);
+    const max = Number(el.getAttribute("aria-valuemax") || 59);
+    const range = max - min + 1;
+
     try { el.focus(); } catch {}
-    const t = String(targetValue);
-    // Try native setter first
-    setNativeProtoValue(el, t);
-    try {
-      el.dispatchEvent(new InputEvent("input", {
-        inputType: "insertReplacementText", data: t, bubbles: true,
-      }));
-    } catch {
-      el.dispatchEvent(new Event("input", { bubbles: true }));
+    await sleep(60);
+    if (document.activeElement !== el) {
+      realClick(el);
+      await sleep(80);
     }
-    try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
-    try { el.dispatchEvent(new FocusEvent("blur", { bubbles: true })); } catch {}
-    return true;
+
+    // Strategy 1: type digits as keystrokes
+    const padded = String(targetNum).padStart(2, "0");
+    for (const ch of padded) {
+      const code = "Digit" + ch;
+      const kc = 48 + Number(ch);
+      const opts = { key: ch, code, keyCode: kc, which: kc, bubbles: true, cancelable: true };
+      try { el.dispatchEvent(new KeyboardEvent("keydown", opts)); } catch {}
+      try { el.dispatchEvent(new KeyboardEvent("keypress", { ...opts, charCode: kc })); } catch {}
+      try { el.dispatchEvent(new KeyboardEvent("keyup", opts)); } catch {}
+      await sleep(45);
+    }
+    await sleep(120);
+    if (Number(el.getAttribute("aria-valuenow")) === targetNum) {
+      log(`spinbutton typing OK \u2192 ${targetNum}`);
+      return true;
+    }
+
+    // Strategy 2: ArrowUp/ArrowDown along shortest circular path
+    const current = Number(el.getAttribute("aria-valuenow") || min);
+    let delta = targetNum - current;
+    if (Math.abs(delta) > range / 2) {
+      delta = delta > 0 ? delta - range : delta + range;
+    }
+    const key = delta > 0 ? "ArrowUp" : "ArrowDown";
+    const kc2 = delta > 0 ? 38 : 40;
+    const steps = Math.abs(delta);
+    log(`spinbutton typing skip, pakai ${key} x ${steps} (curr=${current} \u2192 ${targetNum})`);
+    for (let i = 0; i < steps; i++) {
+      const opts = { key, code: key, keyCode: kc2, which: kc2, bubbles: true, cancelable: true };
+      try { el.dispatchEvent(new KeyboardEvent("keydown", opts)); } catch {}
+      try { el.dispatchEvent(new KeyboardEvent("keyup", opts)); } catch {}
+      await sleep(15);
+      if (Number(el.getAttribute("aria-valuenow")) === targetNum) {
+        log(`spinbutton arrow OK \u2192 ${targetNum} (${i + 1} steps)`);
+        return true;
+      }
+    }
+    const final = Number(el.getAttribute("aria-valuenow"));
+    log(`spinbutton final aria-valuenow=${final}, target=${targetNum}`);
+    return final === targetNum;
   }
 
   /** Klik manusia: dispatch pointer/mouse events (di isolated world) */
@@ -870,11 +920,14 @@
     } catch {}
   }
 
-  /** Isi caption ke row */
+  /** Isi caption ke row dgn typeIntoField (per-character, React+Lexical safe).
+   *  Prioritas target:
+   *   - [role='textbox'][contenteditable='true']  (Lexical rich editor)
+   *   - [contenteditable='true']
+   *   - textarea
+   *  Per-character typing trigger native browser input event yg Lexical
+   *  process aman tanpa crash 'getIn' (yg dialami v1.12 paste approach). */
   async function fillCaptionInRow(row, caption) {
-    // Prioritas: rich-editor (Lexical/contenteditable) dulu, baru textarea polos.
-    // Jika hanya kita target textarea sementara Meta render placeholder via
-    // Lexical state, placeholder akan tetap tampil overlay & React state empty.
     let target =
       row.querySelector("[role='textbox'][contenteditable='true']") ||
       row.querySelector("[contenteditable='true']") ||
@@ -882,9 +935,13 @@
     if (!target) throw new Error("Tidak menemukan input teks pada row");
     log("fill caption target:", target.tagName,
         "role=", target.getAttribute("role"),
-        "contenteditable=", target.getAttribute("contenteditable"));
-    fillTextField(target, caption);
-    // Beri sedikit waktu agar React/Lexical update state
+        "contenteditable=", target.getAttribute("contenteditable"),
+        "len=", caption.length);
+    // Bersihkan dulu (kalau ada placeholder text di textarea/contenteditable)
+    clearTextField(target);
+    await sleep(40);
+    // Type per-character
+    await typeIntoField(target, caption, 12);
     await sleep(120);
   }
 
@@ -926,22 +983,25 @@
   }
 
   /** Cari semua input field jadwal di seluruh dokumen (date, jam, menit).
-   *  Filter by visibility + placeholder/aria pattern. Tidak rely pada
-   *  reference popover yang bisa stale setelah Meta re-render. */
+   *  PENTING: spinbutton input sering sr-only (visually 0px di belakang
+   *  visible label) \u2014 JANGAN filter by visibility. Date input boleh di-filter. */
   function findScheduleInputsInDocument() {
     const all = Array.from(document.querySelectorAll("input"));
     return all.filter((i) => {
-      const rect = i.getBoundingClientRect();
-      if (rect.width === 0 || rect.height === 0) return false;
       const ph = (i.placeholder || "").toLowerCase();
       const aria = (i.getAttribute("aria-label") || "").toLowerCase();
       const role = (i.getAttribute("role") || "").toLowerCase();
+      // Spinbutton: take regardless of visibility (sr-only common)
+      if (role === "spinbutton") return true;
+      // Date: must be visible
+      const rect = i.getBoundingClientRect();
+      const visible = rect.width > 0 && rect.height > 0;
+      if (!visible) return false;
       return (
         ph.includes("dd") || ph.includes("mm") || ph.includes("yyyy") ||
-        aria === "jam" || aria.includes("hour") || aria === "h" ||
-        aria === "menit" || aria.includes("minute") || aria === "min" || aria === "m" ||
         aria.includes("tanggal") || aria.includes("date") ||
-        role === "spinbutton"
+        aria === "jam" || aria.includes("hour") || aria === "h" ||
+        aria === "menit" || aria.includes("minute") || aria === "min" || aria === "m"
       );
     });
   }
@@ -1040,37 +1100,35 @@
     let dateOk = false;
     for (const val of dateCandidates) {
       try {
-        fillTextField(dateInput, val);
-        await sleep(220);
+        await setInputValueOneShot(dateInput, val);
+        await sleep(160);
         const got = (dateInput.value || "").trim();
         log(`try date "${val}" -> input.value="${got}"`);
+        // Heuristic: accepted if value isn't empty and contains either
+        // the day or the month name from our candidate (Meta might
+        // reformat e.g. "24/05/2026" \u2192 "24 Mei 2026")
         if (got !== "") {
-          dateOk = true;
-          break;
+          const ddStr = String(dd);
+          if (got.includes(ddStr) || got.toLowerCase().includes(INDO_MONTHS_FULL[mm].toLowerCase().slice(0, 3))) {
+            dateOk = true;
+            break;
+          }
         }
       } catch (e) {
         log(`set date "${val}" error:`, String(e));
       }
     }
-    if (!dateOk) log("WARN: semua format tanggal gagal di-set");
-
-    // Commit date (Enter + blur)
-    try {
-      dateInput.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-      dateInput.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, which: 13, bubbles: true }));
-      dateInput.dispatchEvent(new FocusEvent("blur", { bubbles: true }));
-    } catch {}
+    if (!dateOk) log("WARN: semua format tanggal gagal di-set; current value:", dateInput.value);
     await sleep(120);
 
     // --- TIME ---
     if (has2Spinbuttons) {
-      // Set jam (hour) sebagai integer (Meta menerima 1-2 digit)
-      const hourVal = String(dateObj.getHours());
-      const minVal = String(dateObj.getMinutes());
-      setSpinbutton(jamInput, hourVal);
+      const hourVal = dateObj.getHours();
+      const minVal = dateObj.getMinutes();
+      const hourOk = await setSpinbutton(jamInput, hourVal);
       await sleep(140);
-      log(`set jam "${hourVal}" -> input.value="${jamInput.value || ""}" ariaNow="${jamInput.getAttribute("aria-valuenow")}"`);
-      setSpinbutton(menitInput, minVal);
+      log(`set jam "${hourVal}" \u2192 valuenow=${jamInput.getAttribute("aria-valuenow")} ok=${hourOk}`);
+      const minOk = await setSpinbutton(menitInput, minVal);
       await sleep(140);
       log(`set menit "${minVal}" -> input.value="${menitInput.value || ""}" ariaNow="${menitInput.getAttribute("aria-valuenow")}"`);
 
@@ -1084,7 +1142,7 @@
       const fallbackTimeInput = jamInput || inputs[inputs.length - 1];
       if (fallbackTimeInput && fallbackTimeInput !== dateInput) {
         const timeVal = `${HH}:${MM}`;
-        fillTextField(fallbackTimeInput, timeVal);
+        await setInputValueOneShot(fallbackTimeInput, timeVal);
         await sleep(180);
         log(`set time fallback "${timeVal}" -> input.value="${fallbackTimeInput.value || ""}"`);
         try { fallbackTimeInput.dispatchEvent(new FocusEvent("blur", { bubbles: true })); } catch {}
@@ -1409,9 +1467,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.13.0",
+      version: "1.14.0",
     };
   };
 
-  log("content script loaded v1.13.0 on", location.href);
+  log("content script loaded v1.14.0 on", location.href);
 })();
