@@ -167,11 +167,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  // Install PERMANENT patch HTMLInputElement.prototype.click di MAIN world.
-  // Patch baca window.__autoPostingState.{active, nextFiles}.
-  // - active && nextFiles  \u2192 set files (DataTransfer) + dispatch change + mark consumed
-  // - active && !nextFiles \u2192 suppress OS dialog (no-op)
-  // - !active              \u2192 original click (OS dialog terbuka normal)
+  // Patch sudah ter-install via inject.js (document_start, MAIN world).
+  // INSTALL_SESSION_PATCH cuma activate.
   if (msg.type === "INSTALL_SESSION_PATCH") {
     const tabId = msg.tabId || sender.tab?.id;
     if (!tabId) {
@@ -183,79 +180,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         target: { tabId },
         world: "MAIN",
         func: () => {
-          if (window.__autoPostingPatched) {
-            window.__autoPostingState.active = true;
-            return { ok: true, already: true };
+          if (!window.__autoPostingPatched) {
+            console.warn("[AutoPosting:patch] activate called but patch not installed yet (inject.js might not have run)");
+            return { ok: false, error: "inject.js patch not loaded" };
           }
-          const origClick = HTMLInputElement.prototype.click;
-          window.__autoPostingState = {
-            active: true,
-            nextFiles: null,
-            consumed: false,
-            lastError: null,
-          };
-          window.__autoPostingOrigClick = origClick;
-
-          function b64ToBytes(b64) {
-            const bin = atob(b64);
-            const len = bin.length;
-            const bytes = new Uint8Array(len);
-            for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
-            return bytes;
-          }
-          function buildFiles(specs) {
-            const dt = new DataTransfer();
-            for (const s of specs) {
-              const bytes = b64ToBytes(s.b64);
-              const blob = new Blob([bytes], { type: s.type || "application/octet-stream" });
-              const file = new File([blob], s.name, {
-                type: blob.type,
-                lastModified: s.lastModified || Date.now(),
-              });
-              dt.items.add(file);
-            }
-            return dt;
-          }
-          function setFilesOn(input, specs) {
-            try {
-              const dt = buildFiles(specs);
-              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "files")?.set;
-              if (setter) setter.call(input, dt.files);
-              else input.files = dt.files;
-              input.dispatchEvent(new Event("change", { bubbles: true }));
-              input.dispatchEvent(new Event("input", { bubbles: true }));
-              // Diagnostic: log file detail (sampai 16 byte pertama hex)
-              const fileMeta = [];
-              for (let i = 0; i < dt.files.length; i++) {
-                const f = dt.files[i];
-                fileMeta.push({ name: f.name, size: f.size, type: f.type });
-              }
-              console.log("[AutoPosting:patch] files set:", fileMeta);
-              return { ok: true, count: dt.files.length, files: fileMeta };
-            } catch (e) {
-              return { ok: false, error: String(e) };
-            }
-          }
-
-          HTMLInputElement.prototype.click = function () {
-            const st = window.__autoPostingState;
-            if (st && st.active && this.type === "file") {
-              if (st.nextFiles && st.nextFiles.length) {
-                const res = setFilesOn(this, st.nextFiles);
-                console.log("[AutoPosting:patch] intercepted input.click()", res, { name: this.name, accept: this.accept });
-                st.nextFiles = null;
-                st.consumed = true;
-                if (!res.ok) st.lastError = res.error;
-                return;
-              }
-              // tidak ada queue: suppress untuk hindari OS dialog
-              console.log("[AutoPosting:patch] suppressed input.click() (no queued files)", { name: this.name });
-              return;
-            }
-            return window.__autoPostingOrigClick.call(this);
-          };
-          window.__autoPostingPatched = true;
-          return { ok: true, already: false };
+          window.__autoPostingState.active = true;
+          console.log("[AutoPosting:patch] ACTIVATED via INSTALL_SESSION_PATCH");
+          return { ok: true, alreadyInstalled: true };
         },
       })
       .then((res) => sendResponse({ ok: true, res }))
@@ -275,7 +206,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         target: { tabId },
         world: "MAIN",
         func: () => {
-          if (window.__autoPostingState) window.__autoPostingState.active = false;
+          if (window.__autoPostingState) {
+            window.__autoPostingState.active = false;
+            console.log("[AutoPosting:patch] DEACTIVATED");
+          }
           return { ok: true };
         },
       })
