@@ -16,6 +16,8 @@ const ui = {
   scheduleStart: /** @type {HTMLInputElement} */ (document.getElementById("schedule-start")),
   scheduleInterval: /** @type {HTMLInputElement} */ (document.getElementById("schedule-interval")),
   scheduleSkipExisting: /** @type {HTMLInputElement} */ (document.getElementById("schedule-skip-existing")),
+  scheduleSkipCaption: /** @type {HTMLInputElement} */ (document.getElementById("schedule-skip-caption")),
+  scheduleContinueOnCaptionError: /** @type {HTMLInputElement} */ (document.getElementById("schedule-continue-on-caption-error")),
   rowDelay: /** @type {HTMLInputElement} */ (document.getElementById("row-delay")),
   forceJpeg: /** @type {HTMLSelectElement} */ (document.getElementById("force-jpeg")),
 
@@ -562,6 +564,8 @@ async function startAutomation() {
   }
   const times = getScheduledTimes();
   const skipExisting = ui.scheduleSkipExisting.checked;
+  const skipCaption = ui.scheduleSkipCaption.checked;
+  const continueOnCaptionError = ui.scheduleContinueOnCaptionError.checked;
   const rowDelaySec = Math.max(0, Number(ui.rowDelay.value || 0));
   const forceJpegMode = ui.forceJpeg.value || "auto";
 
@@ -592,7 +596,7 @@ async function startAutomation() {
   // Init: minta content script siapkan halaman (skip existing kosong jika perlu)
   await chrome.tabs.sendMessage(state.selectedTab.id, {
     type: "INIT_SESSION",
-    options: { skipExisting },
+    options: { skipExisting, skipCaption, continueOnCaptionError },
   });
 
   for (let i = 0; i < usable; i++) {

@@ -149,21 +149,28 @@
     }
   }
 
+  /** Helper: baca isi target dengan benar (INPUT/TEXTAREA value, contenteditable innerText) */
+  function readFieldText(el) {
+    if (!el) return "";
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") return el.value || "";
+    return (el.innerText || el.textContent || "").trim();
+  }
+
   /** Ketik teks ke field. Strategi berbeda by element type:
    *
    *  INPUT/TEXTAREA (React tracker):
    *    Per-char dgn keydown \u2192 beforeinput \u2192 setNativeProtoValue \u2192 input \u2192 keyup
-   *    React onChange terpicu via fiber tracker.
    *
-   *  contenteditable (Lexical):
-   *    1) placeCaretAtEnd \u2014 set selection di akhir
-   *    2) PER-CHAR execCommand("insertText", false, ch) HANYA \u2014 jangan
-   *       dispatch beforeinput/input manual karena execCommand SUDAH fire
-   *       event2 itu secara native. Duplikat event \u2192 Lexical state corrupt
-   *       \u2192 crash 'getIn' (v1.14).
-   *    3) Pastikan TARGET adalah Lexical editor asli (paling dalam), bukan
-   *       combobox wrapper. Lihat findEditableTarget(). */
-  async function typeIntoField(el, text, delay = 18) {
+   *  contenteditable (Lexical) \u2014 multi-strategy, fail-safe:
+   *    Strategy 1: SINGLE beforeinput(insertText, data=full_text, cancelable=true).
+   *                Lexical's listener processes ini sebagai bulk insertion sekali.
+   *                Lebih aman drpd per-char execCommand (yang di v1.15 crash Meta).
+   *    Strategy 2: per-char execCommand("insertText", ch) dgn delay 50ms.
+   *                Hanya kalau Strategy 1 tidak menghasilkan text di DOM.
+   *
+   *  TARGET: harus Lexical editor asli (paling dalam), bukan combobox wrapper.
+   *  Lihat findEditableTarget(). */
+  async function typeIntoField(el, text, delay = 50) {
     if (!el || !text) return false;
     const isText = el.tagName === "INPUT" || el.tagName === "TEXTAREA";
 
@@ -183,30 +190,58 @@
           }));
         } catch {}
         try { el.dispatchEvent(new KeyboardEvent("keyup", { key: ch, bubbles: true, cancelable: true })); } catch {}
-        if (delay > 0) await sleep(delay);
+        if (delay > 0) await sleep(Math.min(delay, 18));
       }
       try { el.dispatchEvent(new Event("change", { bubbles: true })); } catch {}
       return true;
     }
 
-    // contenteditable / Lexical path
+    // contenteditable / Lexical path \u2014 SAFE multi-strategy
     placeCaretAtEnd(el);
-    await sleep(20);
+    await sleep(40);
+
+    // Strategy 1: SINGLE beforeinput with FULL text. Lexical listener
+    // handles bulk insertion via its onBeforeInput hook. This is the
+    // safest because it mirrors how Lexical's IME / paste handler works.
+    let preLen = readFieldText(el).length;
+    try {
+      const ev = new InputEvent("beforeinput", {
+        inputType: "insertText",
+        data: text,
+        bubbles: true,
+        cancelable: true,
+      });
+      el.dispatchEvent(ev);
+    } catch {}
+    await sleep(120);
+    let postLen = readFieldText(el).length;
+    if (postLen > preLen + Math.floor(text.length * 0.5)) {
+      log(`typeIntoField bulk OK: ${preLen}\u2192${postLen}`);
+      return true;
+    }
+
+    log(`typeIntoField bulk failed (${preLen}\u2192${postLen}), fallback per-char execCommand`);
+
+    // Strategy 2: per-char execCommand. SLOW (50ms) to give Lexical time.
+    placeCaretAtEnd(el);
+    await sleep(60);
+    const perCharDelay = Math.max(40, delay);
     for (const ch of text) {
       let inserted = false;
       try {
         inserted = document.execCommand("insertText", false, ch);
       } catch {}
       if (!inserted) {
-        // Fallback (very rare): direct text node append + manual input event
+        // Last resort: dispatch single-char beforeinput
         try {
-          const node = document.createTextNode(ch);
-          el.appendChild(node);
-          placeCaretAtEnd(el);
-          el.dispatchEvent(new InputEvent("input", { inputType: "insertText", data: ch, bubbles: true }));
+          el.dispatchEvent(new InputEvent("beforeinput", {
+            inputType: "insertText", data: ch, bubbles: true, cancelable: true,
+          }));
         } catch {}
       }
-      if (delay > 0) await sleep(delay);
+      // Allow microtask flush so Lexical can complete state update
+      await Promise.resolve();
+      await sleep(perCharDelay);
     }
     return true;
   }
@@ -1010,9 +1045,9 @@
       try { target.focus(); } catch {}
       await sleep(40);
     }
-    // Type per-character via execCommand (browser handles input events natively)
-    await typeIntoField(target, caption, 10);
-    await sleep(120);
+    // Bulk beforeinput first, fallback per-char (slow) only if bulk fails
+    await typeIntoField(target, caption, 50);
+    await sleep(150);
   }
 
   /** Klik tombol dropdown "Terbitkan s..." pada row */
@@ -1270,6 +1305,8 @@
   /** State per session */
   const session = {
     skipExisting: true,
+    skipCaption: false,
+    continueOnCaptionError: true,
     processedCount: 0,
   };
 
@@ -1332,21 +1369,51 @@
     // Upload media
     await uploadFilesToRow(row, files);
 
-    // Isi caption
-    await fillCaptionInRow(row, job.caption);
-    await sleep(100);
+    // Isi caption (opsional + non-fatal)
+    let captionStatus = "skipped";
+    let captionError = null;
+    if (session.skipCaption) {
+      log("caption SKIP (option enabled) \u2014 isi manual nanti");
+    } else if (!job.caption) {
+      log("caption kosong, skip");
+    } else {
+      try {
+        await fillCaptionInRow(row, job.caption);
+        captionStatus = "ok";
+        await sleep(200);
+      } catch (e) {
+        captionStatus = "error";
+        captionError = String(e?.message || e);
+        warn("fillCaptionInRow error:", captionError);
+        if (!session.continueOnCaptionError) {
+          throw new Error(`Gagal isi caption: ${captionError}`);
+        }
+        // Jeda lebih panjang setelah error untuk recovery state
+        await sleep(500);
+      }
+    }
 
     // Set jadwal (jika ada)
+    let scheduleStatus = "skipped";
     if (job.scheduledAt) {
-      const dt = new Date(job.scheduledAt);
-      const popover = await openScheduleDropdown(row);
-      await selectScheduleTab(popover);
-      await setScheduleDateTime(popover, dt);
-      await clickPerbarui(popover);
+      try {
+        const dt = new Date(job.scheduledAt);
+        const popover = await openScheduleDropdown(row);
+        await selectScheduleTab(popover);
+        await setScheduleDateTime(popover, dt);
+        await clickPerbarui(popover);
+        scheduleStatus = "ok";
+      } catch (e) {
+        scheduleStatus = "error";
+        const msg = String(e?.message || e);
+        warn("schedule error:", msg);
+        throw new Error(`Gagal set jadwal: ${msg}`);
+      }
     }
 
     session.processedCount += 1;
-    return { ok: true, message: "OK" };
+    const note = `caption=${captionStatus}${captionError ? `(${captionError})` : ""}, schedule=${scheduleStatus}`;
+    return { ok: true, message: note };
   }
 
   function guessType(name) {
@@ -1485,6 +1552,8 @@
 
     if (msg.type === "INIT_SESSION") {
       session.skipExisting = !!msg.options?.skipExisting;
+      session.skipCaption = !!msg.options?.skipCaption;
+      session.continueOnCaptionError = msg.options?.continueOnCaptionError !== false;
       session.processedCount = 0;
       showBadge();
       // Install patch session permanen (intercept SEMUA input.click() selama session aktif)
@@ -1537,9 +1606,9 @@
         attachedToDom: document.body.contains(i),
       })),
       url: location.href,
-      version: "1.15.0",
+      version: "1.16.0",
     };
   };
 
-  log("content script loaded v1.15.0 on", location.href);
+  log("content script loaded v1.16.0 on", location.href);
 })();
