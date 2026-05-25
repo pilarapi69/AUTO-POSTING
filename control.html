@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="id">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Auto Posting · Meta Business Suite</title>
+    <link rel="stylesheet" href="control.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="hero">
+        <div class="hero-bg"></div>
+        <div class="hero-content">
+          <div class="logo">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+          </div>
+          <div>
+            <h1>Auto Posting</h1>
+            <p class="subtitle">Penjadwalan massal otomatis · Meta Business Suite</p>
+          </div>
+        </div>
+      </header>
+
+      <main class="content">
+        <section class="card" id="step-tab">
+          <div class="card-head">
+            <div class="step-num">1</div>
+            <div>
+              <h2>Tab Meta Business Suite</h2>
+              <p class="muted">Pilih tab yang membuka halaman <strong>Jadwalkan postingan massal</strong>.</p>
+            </div>
+          </div>
+          <div class="row">
+            <select id="tab-select" class="select">
+              <option value="">— Memuat tab —</option>
+            </select>
+            <button id="refresh-tabs" class="btn btn-ghost" type="button" title="Refresh daftar tab">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+            </button>
+          </div>
+          <p class="hint" id="tab-hint"></p>
+        </section>
+
+        <section class="card" id="step-media">
+          <div class="card-head">
+            <div class="step-num">2</div>
+            <div>
+              <h2>Folder Media</h2>
+              <p class="muted">Pilih folder berisi foto/video. File akan diurutkan alfabet. Subfolder = post dengan multi-media.</p>
+            </div>
+          </div>
+          <div class="row">
+            <label class="btn btn-outline" for="media-input">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+              <span>Pilih Folder</span>
+            </label>
+            <input id="media-input" type="file" webkitdirectory directory multiple hidden />
+            <span id="media-summary" class="muted">Belum dipilih</span>
+          </div>
+        </section>
+
+        <section class="card" id="step-caption">
+          <div class="card-head">
+            <div class="step-num">3</div>
+            <div>
+              <h2>File Caption (.txt)</h2>
+              <p class="muted">Pisahkan tiap caption dengan baris <code>---</code> (atau baris kosong).</p>
+            </div>
+          </div>
+          <div class="row">
+            <label class="btn btn-outline" for="caption-input">
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
+              <span>Pilih File TXT</span>
+            </label>
+            <input id="caption-input" type="file" accept=".txt,text/plain" hidden />
+            <span id="caption-summary" class="muted">Belum dipilih</span>
+          </div>
+        </section>
+
+        <section class="card" id="step-schedule">
+          <div class="card-head">
+            <div class="step-num">4</div>
+            <div>
+              <h2>Jadwal Otomatis</h2>
+              <p class="muted">Waktu mulai dan jarak antar posting.</p>
+            </div>
+          </div>
+          <div class="grid-2">
+            <label class="field">
+              <span>Mulai dari</span>
+              <input id="schedule-start" type="datetime-local" />
+            </label>
+            <label class="field">
+              <span>Interval (menit)</span>
+              <input id="schedule-interval" type="number" min="1" step="1" value="60" />
+            </label>
+          </div>
+          <div class="grid-2" style="margin-top: 8px">
+            <label class="field">
+              <span>Jeda antar postingan (detik)</span>
+              <input id="row-delay" type="number" min="0" step="1" value="3" />
+            </label>
+            <label class="field">
+              <span>Re-encode PNG &rarr; JPEG sebelum upload</span>
+              <select id="force-jpeg">
+                <option value="auto" selected>Otomatis (hanya jika &gt; 10MB)</option>
+                <option value="always">Selalu (lebih reliable, file lebih kecil)</option>
+              </select>
+            </label>
+          </div>
+          <div class="row" style="margin-top: 8px">
+            <label class="checkbox">
+              <input id="schedule-skip-existing" type="checkbox" checked />
+              <span>Lewati baris kosong yang sudah ada (gunakan dulu sebelum tambah baru)</span>
+            </label>
+          </div>
+          <div class="row" style="margin-top: 8px">
+            <label class="checkbox">
+              <input id="schedule-skip-caption" type="checkbox" />
+              <span>Lewati pengisian caption (kalau editor Meta sering crash; isi caption manual)</span>
+            </label>
+          </div>
+          <div class="row" style="margin-top: 8px">
+            <label class="checkbox">
+              <input id="schedule-continue-on-caption-error" type="checkbox" checked />
+              <span>Lanjut ke jadwal walau caption gagal (jangan stop seluruh proses)</span>
+            </label>
+          </div>
+        </section>
+
+        <section class="card warn-card hidden" id="step-warn">
+          <div class="card-head">
+            <div class="step-num" style="background: rgba(245,158,11,0.16); color: var(--warning);">!</div>
+            <div>
+              <h2>File &gt; 10 MB</h2>
+              <p class="muted" id="warn-summary">—</p>
+            </div>
+          </div>
+          <div class="row" style="margin-bottom: 8px">
+            <label class="checkbox">
+              <input id="auto-compress" type="checkbox" checked />
+              <span>Auto-compress jadi JPEG saat upload (target &lt; 9.5MB, max 2048px)</span>
+            </label>
+          </div>
+          <ul id="warn-list" class="warn-list"></ul>
+        </section>
+
+        <section class="card" id="step-preview">
+          <div class="card-head">
+            <div class="step-num">5</div>
+            <div>
+              <h2>Preview</h2>
+              <p class="muted">Pasangan media ↔ caption sebelum START.</p>
+            </div>
+          </div>
+          <ul id="preview-list" class="preview-list">
+            <li class="empty">Belum ada data preview.</li>
+          </ul>
+        </section>
+
+        <section class="card actions-card">
+          <div class="row" style="justify-content: space-between; gap: 8px">
+            <button id="btn-start" class="btn btn-primary" type="button" disabled>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg>
+              <span>START</span>
+            </button>
+            <button id="btn-stop" class="btn btn-danger" type="button" disabled>
+              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="6" y="6" width="12" height="12"></rect></svg>
+              <span>STOP</span>
+            </button>
+          </div>
+          <div class="progress">
+            <div class="progress-bar"><div id="progress-fill" class="progress-fill"></div></div>
+            <span id="progress-label" class="muted">Idle</span>
+          </div>
+        </section>
+
+        <section class="card log-card">
+          <div class="card-head">
+            <div class="step-num">·</div>
+            <div>
+              <h2>Log</h2>
+              <p class="muted">Status setiap langkah automasi.</p>
+            </div>
+          </div>
+          <div id="log" class="log" role="log" aria-live="polite"></div>
+        </section>
+      </main>
+
+      <footer class="footer">
+        <span class="muted">Tombol <strong>Terbitkan</strong> tetap diklik manual oleh Anda.</span>
+      </footer>
+    </div>
+    <script src="control.js"></script>
+  </body>
+</html>

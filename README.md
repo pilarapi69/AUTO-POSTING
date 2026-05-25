@@ -79,7 +79,16 @@ AUTO-POSTING/
 | "Tidak ada tab business.facebook.com" | Belum buka Meta Business Suite | Buka halaman bulk composer dulu, klik refresh tab di panel. |
 | "Tombol Tambahkan postingan tidak ditemukan" | Bahasa UI bukan Indonesia / halaman belum siap | Reload halaman dan tunggu sampai siap. Pastikan bahasa = Indonesia. |
 | Media tidak ter-upload | Format tidak didukung Meta | Cek ekstensi file. Meta umumnya menerima JPG/PNG/MP4/MOV. |
+| "Timeout menunggu input file pada row" | Input file di-mount global oleh Meta | Sudah dihandle v1.1.0 via prototype-click hook + MutationObserver. Update extension dan reload tab. |
 | Tanggal tidak terisi | Field tanggal pakai format berbeda | Lihat log di console. File `content.js` (`setScheduleDateTime`) mencoba beberapa format; sesuaikan jika perlu. |
+
+### Debug
+
+Buka DevTools (F12) di tab Meta Business Suite, lalu di Console jalankan:
+```js
+__autoPostingDebug()
+```
+Akan menampilkan: jumlah row terdeteksi, status tiap row (media/teks), jumlah file input global, dll. Gunakan untuk troubleshooting jika ada step yang gagal.
 
 ## Lisensi
 
